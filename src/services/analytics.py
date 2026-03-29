@@ -2,7 +2,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, text, and_
 from datetime import datetime, timedelta, timezone
 import pytz
-from src.db.models import Order, PlatformEnum
+from src.db.models import Order, PlatformEnum, Product
 from typing import Optional
 
 async def get_sales_for_range(session: AsyncSession, start_time: datetime, end_time: datetime, platform: Optional[PlatformEnum] = None):
@@ -78,15 +78,17 @@ async def get_weekly_top_product(session: AsyncSession):
     return None
 
 async def get_today_top_product(session: AsyncSession):
-    """Returns the top-selling product for today based on quantity sold."""
-    now = datetime.now(timezone.utc)
-    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    """Returns the top-selling product for today based on quantity sold, with its revenue."""
+    dhaka_tz = pytz.timezone("Asia/Dhaka")
+    now_dhaka = datetime.now(dhaka_tz)
+    start_of_day_utc = now_dhaka.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
 
     query = select(
         Order.product_name,
-        func.sum(Order.quantity).label("total_qty")
+        func.sum(Order.quantity).label("total_qty"),
+        func.sum(Order.price * Order.quantity).label("total_revenue")
     ).where(
-        Order.timestamp >= start_of_day
+        Order.timestamp >= start_of_day_utc
     ).group_by(
         Order.product_name
     ).order_by(
@@ -96,7 +98,11 @@ async def get_today_top_product(session: AsyncSession):
     result = await session.execute(query)
     row = result.first()
     if row:
-        return {"product_name": row.product_name, "quantity": row.total_qty}
+        return {
+            "product_name": row.product_name, 
+            "quantity": int(row.total_qty),
+            "revenue": float(row.total_revenue or 0)
+        }
     return None
 
 async def get_top_product(session: AsyncSession):
@@ -183,3 +189,75 @@ async def get_pending_orders(session: AsyncSession, limit: int = 10, platform: O
     query = select(Order).where(and_(*conditions)).order_by(Order.timestamp.desc()).limit(limit)
     result = await session.execute(query)
     return result.scalars().all()
+
+async def get_stock_predictions(session: AsyncSession, lookback_days: int = 30):
+    """
+    Predicts when products will run out based on sales trends.
+    Calculates average daily sales and days remaining.
+    """
+    # 1. Fetch all products
+    products_query = select(Product)
+    products_result = await session.execute(products_query)
+    products = products_result.scalars().all()
+    
+    if not products:
+        return []
+    
+    # 2. Calculate average daily sales for each product over lookback period
+    start_date = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    
+    sales_query = select(
+        Order.product_name,
+        func.sum(Order.quantity).label("total_qty")
+    ).where(
+        Order.timestamp >= start_date
+    ).group_by(
+        Order.product_name
+    )
+    
+    sales_result = await session.execute(sales_query)
+    sales_data = {row.product_name: float(row.total_qty) for row in sales_result}
+    
+    predictions = []
+    for p in products:
+        total_sold = sales_data.get(p.name, 0)
+        avg_daily_sales = total_sold / lookback_days
+        
+        if avg_daily_sales > 0:
+            days_remaining = p.current_stock / avg_daily_sales
+        else:
+            # If no sales in lookback period, but has stock, it's not "running out"
+            days_remaining = 999  # Large number instead of inf for easier formatting
+            
+        predictions.append({
+            "product_name": p.name,
+            "current_stock": p.current_stock,
+            "avg_daily_sales": avg_daily_sales,
+            "days_remaining": days_remaining
+        })
+        
+    return predictions
+
+async def get_revenue_breakdown(session: AsyncSession, start_time: datetime, end_time: datetime, limit: int = 3):
+    """
+    Returns the top products by revenue (price * quantity) for a given UTC time range.
+    """
+    query = select(
+        Order.product_name,
+        func.sum(Order.price * Order.quantity).label("total_revenue")
+    ).where(
+        Order.timestamp >= start_time,
+        Order.timestamp < end_time
+    ).group_by(
+        Order.product_name
+    ).order_by(
+        text("total_revenue DESC")
+    ).limit(limit)
+    
+    result = await session.execute(query)
+    rows = result.all()
+    
+    return [
+        {"product_name": row.product_name, "revenue": float(row.total_revenue or 0)}
+        for row in rows
+    ]

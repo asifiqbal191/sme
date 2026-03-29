@@ -13,6 +13,7 @@ import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from datetime import datetime, timezone
 from pytz import timezone as pytz_timezone
 
 from src.core.config import settings
@@ -61,35 +62,109 @@ async def _send_telegram_message(text: str):
 # ---------------------------------------------------------------------------
 
 async def _generate_daily_report():
-    """Build and send the daily sales report."""
-    logger.info("Generating daily report...")
+    """Build and send the enhanced intelligent daily report."""
+    logger.info("Generating intelligent daily report...")
     try:
         async with async_session() as session:
-            stats = await analytics.get_daily_sales(session)
+            # 1. Basic Stats
+            today_stats = await analytics.get_daily_sales(session)
+            total_sales = today_stats["total_sales"]
+            order_count = today_stats["total_orders"]
+            
+            # 2. Performance Insight (Today vs Yesterday)
+            yesterday_stats = await analytics.get_yesterday_sales(session)
+            yesterday_sales = yesterday_stats["total_sales"]
+            
+            growth_str = "0%"
+            if yesterday_sales > 0:
+                growth = ((total_sales - yesterday_sales) / yesterday_sales) * 100
+                growth_str = f"{'+' if growth >= 0 else ''}{growth:.1f}%"
+            elif total_sales > 0:
+                growth_str = "+100%"
+                
+            # 3. Product Analysis (Top product + contribution)
             top = await analytics.get_today_top_product(session)
+            
+            # 4. Revenue Breakdown (Top 3)
+            # Use Dhaka time for consistent 'today' boundaries
+            now_dhaka = datetime.now(DHAKA_TZ)
+            start_of_day_utc = now_dhaka.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+            end_of_day_utc = datetime.now(timezone.utc)
+            
+            breakdown = await analytics.get_revenue_breakdown(session, start_of_day_utc, end_of_day_utc)
+            
+            # 5. Alert System
+            LOW_SALES_THRESHOLD = 1000.0
+            LOW_ORDERS_THRESHOLD = 2 # Lowered for testing
+            alerts = []
+            if total_sales < LOW_SALES_THRESHOLD:
+                alerts.append("⚠️ Low sales detected today")
+            if order_count < LOW_ORDERS_THRESHOLD:
+                alerts.append("⚠️ Order volume is low")
 
-        total_sales = stats["total_sales"]
-        order_count = stats["total_orders"]
+            # 6. AI Recommendations
+            recommendations = []
+            # Performance based
+            if growth_str.startswith('+'):
+                val = float(growth_str.strip('+%'))
+                if val > 20: recommendations.append("🚀 Great growth! Celebrate and promote top product tomorrow.")
+                else: recommendations.append("📈 Steady growth. Keep your current strategy.")
+            elif growth_str.startswith('-'):
+                recommendations.append("📉 Sales are down. Consider a flash discount or checking ad campaigns.")
+            
+            # Product based
+            if top and total_sales > 0:
+                contribution = (top["revenue"] / total_sales) * 100
+                if contribution > 50:
+                    recommendations.append("🎯 One product is dominating. Consider diversifying your catalog.")
+            
+            if total_sales == 0:
+                recommendations.append("🔍 No sales today? Check if your order parsing is working correctly.")
 
-        msg = (
-            f"📊 *Daily Report:*\n"
-            f"Sales: ৳{total_sales:,.2f}\n"
-            f"Orders: {order_count}\n"
-        )
+            if not recommendations:
+                recommendations.append("✅ Monitoring looks good. Focus on customer response speed.")
 
-        if top:
-            msg += (
-                f"\n🔥 *Top Product:*\n"
-                f"{top['product_name']} ({top['quantity']} sold)"
-            )
-        else:
-            msg += "\n_No sales recorded today._"
+            # Build Message
+            msg_parts = [
+                f"📊 *Daily Report:*",
+                f"Sales: ৳{total_sales:,.2f}",
+                f"Orders: {order_count}",
+                f"",
+                f"📈 *Performance Insight:*",
+                f"Sales Change: *{growth_str}* (vs yesterday)",
+                f""
+            ]
+            
+            if top:
+                contribution = (top["revenue"] / total_sales) * 100 if total_sales > 0 else 0
+                msg_parts.extend([
+                    f"🔥 *Top Product:*",
+                    f"{top['product_name']} ({top['quantity']} sold)",
+                    f"",
+                    f"💡 *Insight:*",
+                    f"This product contributed {contribution:.1f}% of total sales",
+                    f""
+                ])
+                
+            if breakdown:
+                msg_parts.append(f"💰 *Revenue Breakdown:*")
+                for item in breakdown:
+                    msg_parts.append(f"{item['product_name']} → ৳{item['revenue']:,.2f}")
+                msg_parts.append("")
+                
+            if alerts:
+                msg_parts.extend(alerts)
+                msg_parts.append("")
+                
+            msg_parts.append(f"🤖 *AI Recommendation:*")
+            for rec in recommendations:
+                msg_parts.append(f"- {rec}")
 
-        await _send_telegram_message(msg)
-        logger.info("Daily report task completed.")
+            await _send_telegram_message("\n".join(msg_parts))
+            logger.info("Intelligent daily report task completed.")
 
     except Exception as e:
-        logger.error(f"Error generating daily report: {e}", exc_info=True)
+        logger.error(f"Error generating intelligent daily report: {e}", exc_info=True)
 
 
 async def _generate_weekly_report():
@@ -246,6 +321,40 @@ async def _generate_growth_report():
 
     except Exception as e:
         logger.error(f"Error generating growth report: {e}", exc_info=True)
+        
+async def _check_stock_prediction_alerts():
+    """
+    Predicts when products will run out and sends alerts for those < 5 days.
+    Run daily at 10:20 PM.
+    """
+    logger.info("Checking for stock prediction alerts...")
+    try:
+        async with async_session() as session:
+            predictions = await analytics.get_stock_predictions(session)
+
+        alerts_sent = 0
+        for p in predictions:
+            days = p["days_remaining"]
+            if days < 5:
+                # Format days nicely
+                days_str = f"{days:.1f}" if days > 0 else "0"
+                msg = (
+                    f"📦 *Stock Alert:*\n"
+                    f"*{p['product_name']}* may run out in *{days_str}* days.\n\n"
+                    f"Current Stock: {p['current_stock']} units\n"
+                    f"Avg Daily Sales: {p['avg_daily_sales']:.2f} units"
+                )
+                await _send_telegram_message(msg)
+                alerts_sent += 1
+                logger.info(f"Stock alert sent for {p['product_name']}: {days_str} days remaining.")
+        
+        if alerts_sent == 0:
+            logger.info("No stock alerts needed today.")
+        else:
+            logger.info(f"Total stock alerts sent: {alerts_sent}")
+
+    except Exception as e:
+        logger.error(f"Error checking stock prediction alerts: {e}", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +429,15 @@ def start_scheduler():
         trigger=CronTrigger(hour=22, minute=15, timezone=DHAKA_TZ),
         id="growth_comparison_report",
         name="Growth Comparison Report",
+        replace_existing=True,
+    )
+
+    # ── Stock Prediction Alert: every day at 10:20 PM Asia/Dhaka ──
+    scheduler.add_job(
+        _check_stock_prediction_alerts,
+        trigger=CronTrigger(hour=22, minute=20, timezone=DHAKA_TZ),
+        id="stock_prediction_alert",
+        name="Stock Prediction Alert",
         replace_existing=True,
     )
 
