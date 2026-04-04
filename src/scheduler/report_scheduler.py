@@ -86,12 +86,11 @@ async def _generate_daily_report():
             top = await analytics.get_today_top_product(session)
             
             # 4. Revenue Breakdown (Top 3)
-            # Use Dhaka time for consistent 'today' boundaries
-            now_dhaka = datetime.now(DHAKA_TZ)
-            start_of_day_utc = now_dhaka.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
-            end_of_day_utc = datetime.now(timezone.utc)
+            # Use Dhaka local time (DB now stores local time)
+            now_dhaka = datetime.now(DHAKA_TZ).replace(tzinfo=None)
+            start_of_day = now_dhaka.replace(hour=0, minute=0, second=0, microsecond=0)
             
-            breakdown = await analytics.get_revenue_breakdown(session, start_of_day_utc, end_of_day_utc)
+            breakdown = await analytics.get_revenue_breakdown(session, start_of_day, now_dhaka)
             
             # 5. Alert System
             LOW_SALES_THRESHOLD = 1000.0

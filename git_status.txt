@@ -1,0 +1,36 @@
+﻿ M main.py
+ M requirements.txt
+ D src/api/webhooks.py
+ M src/bot/telegram_bot.py
+ M src/core/config.py
+ M src/db/models.py
+ M src/scheduler/report_scheduler.py
+ M src/services/analytics.py
+ M src/services/parser.py
+ M src/services/payment.py
+ M src/services/sheets.py
+?? all_orders.txt
+?? all_orders_cleaned.txt
+?? check_db.py
+?? check_db_more.py
+?? db_debug.txt
+?? db_debug_script.py
+?? db_output.txt
+?? delete_dummies.py
+?? fix_db.py
+?? git_status.txt
+?? list_orders.py
+?? show_db_config.py
+?? src/auth/
+?? src/bot/handlers.py
+?? src/services/config_service.py
+?? src/services/order_service.py
+?? start.bat
+?? start.py
+?? test_bot.py
+?? test_dynamic_config.py
+?? test_parser_fix.py
+?? test_results.txt
+?? tests/test_message_detector.py
+?? verify_sales.py
+?? verify_sheet_fix.py

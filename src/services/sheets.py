@@ -4,6 +4,7 @@ from typing import Dict, Any
 from src.core.config import settings
 from google.oauth2.service_account import Credentials
 import logging
+from src.services.config_service import get_active_sheet_name
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +14,11 @@ async def push_to_google_sheets(order_data: Dict[str, Any]):
     The order_data dict should have keys like:
     id, order_id, product_name, quantity, price, platform, timestamp, payment_status, phone_number
     """
+    sheet_name = await get_active_sheet_name()
+    if not sheet_name:
+        logger.warning("No Google Sheet name set in config. Skipping sync.")
+        return
+
     def _sync_append():
         try:
             creds = Credentials.from_service_account_file(
@@ -26,7 +32,7 @@ async def push_to_google_sheets(order_data: Dict[str, Any]):
             
             # Open spreadsheet and worksheet
             try:
-                sheet = client.open(settings.GOOGLE_SHEET_NAME).sheet1
+                sheet = client.open(sheet_name).sheet1
                 
                 # Ensure headers exist
                 first_row = sheet.row_values(1)
@@ -71,10 +77,17 @@ async def push_to_google_sheets(order_data: Dict[str, Any]):
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _sync_append)
 
-async def check_google_sheets_connection():
+async def check_google_sheets_connection(sheet_name: str = None):
     """
     Attempts to connect to Google Sheets and return row count or error message.
+    If sheet_name is None, it uses the active one from DB.
     """
+    if not sheet_name:
+        sheet_name = await get_active_sheet_name()
+        
+    if not sheet_name:
+        return {"success": False, "error": "❌ No spreadsheet name provided or set in settings."}
+
     def _sync_check():
         try:
             creds = Credentials.from_service_account_file(
@@ -87,7 +100,7 @@ async def check_google_sheets_connection():
             client = gspread.authorize(creds)
             
             try:
-                sheet = client.open(settings.GOOGLE_SHEET_NAME).sheet1
+                sheet = client.open(sheet_name).sheet1
                 count = len(sheet.get_all_values())
                 url = sheet.url
                 return {"success": True, "count": count, "url": url}

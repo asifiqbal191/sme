@@ -1,9 +1,13 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, text, and_
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import pytz
-from src.db.models import Order, PlatformEnum, Product
+from src.db.models import Order, PlatformEnum, Product, DHAKA_TZ
 from typing import Optional
+
+def _now_local():
+    """Returns current local time as naive datetime (for DB comparison)."""
+    return datetime.now(DHAKA_TZ).replace(tzinfo=None)
 
 async def get_sales_for_range(session: AsyncSession, start_time: datetime, end_time: datetime, platform: Optional[PlatformEnum] = None):
     """
@@ -14,7 +18,7 @@ async def get_sales_for_range(session: AsyncSession, start_time: datetime, end_t
         conditions.append(Order.platform == platform)
     
     query = select(
-        func.sum(Order.price * Order.quantity).label("total_sales"),
+        func.sum(Order.price).label("total_sales"),
         func.count(Order.id).label("total_orders")
     ).where(and_(*conditions))
     
@@ -30,36 +34,24 @@ async def get_daily_sales(session: AsyncSession, platform: Optional[PlatformEnum
     """
     Returns total sales amount and total orders for today (Asia/Dhaka time).
     """
-    dhaka_tz = pytz.timezone("Asia/Dhaka")
-    now_dhaka = datetime.now(dhaka_tz)
+    now = _now_local()
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     
-    # Start of today in Dhaka: 00:00:00
-    start_of_day_dhaka = now_dhaka.replace(hour=0, minute=0, second=0, microsecond=0)
-    # Convert to UTC for DB query
-    start_of_day_utc = start_of_day_dhaka.astimezone(timezone.utc)
-    
-    return await get_sales_for_range(session, start_of_day_utc, datetime.now(timezone.utc), platform)
+    return await get_sales_for_range(session, start_of_day, now, platform)
 
 async def get_yesterday_sales(session: AsyncSession, platform: Optional[PlatformEnum] = None):
     """
     Returns total sales amount and total orders for yesterday (Asia/Dhaka time).
     """
-    dhaka_tz = pytz.timezone("Asia/Dhaka")
-    now_dhaka = datetime.now(dhaka_tz)
+    now = _now_local()
+    yesterday = now - timedelta(days=1)
+    start_of_yesterday = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_yesterday = start_of_yesterday + timedelta(days=1)
     
-    # Yesterday in Dhaka
-    yesterday_dhaka = now_dhaka - timedelta(days=1)
-    start_of_yesterday_dhaka = yesterday_dhaka.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_of_yesterday_dhaka = start_of_yesterday_dhaka + timedelta(days=1)
-    
-    # Convert to UTC for DB query
-    start_utc = start_of_yesterday_dhaka.astimezone(timezone.utc)
-    end_utc = end_of_yesterday_dhaka.astimezone(timezone.utc)
-    
-    return await get_sales_for_range(session, start_utc, end_utc, platform)
+    return await get_sales_for_range(session, start_of_yesterday, end_of_yesterday, platform)
 
 async def get_weekly_top_product(session: AsyncSession):
-    seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    seven_days_ago = _now_local() - timedelta(days=7)
     query = select(
         Order.product_name,
         func.sum(Order.quantity).label("total_qty")
@@ -79,16 +71,15 @@ async def get_weekly_top_product(session: AsyncSession):
 
 async def get_today_top_product(session: AsyncSession):
     """Returns the top-selling product for today based on quantity sold, with its revenue."""
-    dhaka_tz = pytz.timezone("Asia/Dhaka")
-    now_dhaka = datetime.now(dhaka_tz)
-    start_of_day_utc = now_dhaka.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    now = _now_local()
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     query = select(
         Order.product_name,
         func.sum(Order.quantity).label("total_qty"),
-        func.sum(Order.price * Order.quantity).label("total_revenue")
+        func.sum(Order.price).label("total_revenue")
     ).where(
-        Order.timestamp >= start_of_day_utc
+        Order.timestamp >= start_of_day
     ).group_by(
         Order.product_name
     ).order_by(
@@ -115,10 +106,10 @@ async def get_top_product(session: AsyncSession):
 
 async def get_weekly_sales(session: AsyncSession):
     """Returns total sales amount for the last 7 days."""
-    seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    seven_days_ago = _now_local() - timedelta(days=7)
 
     query = select(
-        func.sum(Order.price * Order.quantity).label("total_sales"),
+        func.sum(Order.price).label("total_sales"),
         func.count(Order.id).label("total_orders")
     ).where(Order.timestamp >= seven_days_ago)
 
@@ -132,10 +123,10 @@ async def get_weekly_sales(session: AsyncSession):
 
 async def get_monthly_sales(session: AsyncSession):
     """Returns total sales amount for the last 30 days."""
-    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+    thirty_days_ago = _now_local() - timedelta(days=30)
 
     query = select(
-        func.sum(Order.price * Order.quantity).label("total_sales"),
+        func.sum(Order.price).label("total_sales"),
         func.count(Order.id).label("total_orders")
     ).where(Order.timestamp >= thirty_days_ago)
 
@@ -149,7 +140,7 @@ async def get_monthly_sales(session: AsyncSession):
 
 async def get_monthly_top_product(session: AsyncSession):
     """Returns the top-selling product for the last 30 days."""
-    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+    thirty_days_ago = _now_local() - timedelta(days=30)
     query = select(
         Order.product_name,
         func.sum(Order.quantity).label("total_qty")
@@ -204,7 +195,7 @@ async def get_stock_predictions(session: AsyncSession, lookback_days: int = 30):
         return []
     
     # 2. Calculate average daily sales for each product over lookback period
-    start_date = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    start_date = _now_local() - timedelta(days=lookback_days)
     
     sales_query = select(
         Order.product_name,
@@ -244,7 +235,7 @@ async def get_revenue_breakdown(session: AsyncSession, start_time: datetime, end
     """
     query = select(
         Order.product_name,
-        func.sum(Order.price * Order.quantity).label("total_revenue")
+        func.sum(Order.price).label("total_revenue")
     ).where(
         Order.timestamp >= start_time,
         Order.timestamp < end_time

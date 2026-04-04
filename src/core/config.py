@@ -15,10 +15,6 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
     
-    # Webhooks & APIs
-    FACEBOOK_VERIFY_TOKEN: str = "my_custom_verify_token_123"
-    WHATSAPP_VERIFY_TOKEN: str = "my_whatsapp_verify_token_123"
-    
     # Google Sheets
     GOOGLE_SHEET_NAME: str = "Orders Dashboard"
     GOOGLE_CREDENTIALS_FILE: str = "service_account.json"

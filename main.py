@@ -4,7 +4,6 @@ from fastapi import FastAPI
 from src.core.config import settings
 from src.db.session import engine
 from src.db.models import Base
-from src.api.webhooks import router as webhooks_router
 from src.bot.telegram_bot import create_bot_application
 from src.scheduler.report_scheduler import start_scheduler, stop_scheduler, _capture_event_loop
 import asyncio
@@ -22,7 +21,7 @@ bot_app = None
 async def lifespan(app: FastAPI):
     global bot_app
     
-    # Initialize DB (Simple creation for this example, use Alembic usually)
+    # Initialize DB
     logger.info("Initializing database schema...")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -30,20 +29,6 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up Telegram Bot...")
     if settings.TELEGRAM_BOT_TOKEN:
         bot_app = await create_bot_application()
-        
-        # Add Handlers
-        from src.bot.telegram_bot import start_command, today_command, orders_command, top_command, pending_command, button_handler, check_sheets_command, chatid_command, handle_message
-        from telegram.ext import CommandHandler, CallbackQueryHandler, MessageHandler, filters
-        bot_app.add_handler(CommandHandler("start", start_command))
-        bot_app.add_handler(CommandHandler("today", today_command))
-        bot_app.add_handler(CommandHandler("orders", orders_command))
-        bot_app.add_handler(CommandHandler("top", top_command))
-        bot_app.add_handler(CommandHandler("pending", pending_command))
-        bot_app.add_handler(CommandHandler("check_sheets", check_sheets_command))
-        bot_app.add_handler(CommandHandler("chatid", chatid_command))
-        bot_app.add_handler(CallbackQueryHandler(button_handler))
-        bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-        
         await bot_app.initialize()
         await bot_app.start()
         await bot_app.updater.start_polling(drop_pending_updates=True)
@@ -61,7 +46,6 @@ async def lifespan(app: FastAPI):
     yield
     
     # Teardown
-    # Stop the report scheduler
     try:
         stop_scheduler()
     except Exception as e:
@@ -77,9 +61,6 @@ app = FastAPI(
     title=settings.PROJECT_NAME,
     lifespan=lifespan
 )
-
-# Include Routers
-app.include_router(webhooks_router, tags=["Webhooks"])
 
 @app.get("/")
 async def root():

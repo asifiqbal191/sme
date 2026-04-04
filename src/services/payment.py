@@ -1,7 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
-from datetime import datetime, timedelta, timezone
-from src.db.models import Order, Payment, PaymentStatusEnum
+from datetime import datetime, timedelta
+from src.db.models import Order, Payment, PaymentStatusEnum, DHAKA_TZ
 import logging
 
 logger = logging.getLogger(__name__)
@@ -13,7 +13,8 @@ async def match_payment(session: AsyncSession, amount: float, sender_phone: str)
     We match if there's exactly one pending order with the same missing price,
     or if phone number matches exactly and price matches exactly.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(DHAKA_TZ).replace(tzinfo=None)
+
     # Consider orders from the last 3 days
     three_days_ago = now - timedelta(days=3)
     
