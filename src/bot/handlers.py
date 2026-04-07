@@ -1,12 +1,14 @@
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import ContextTypes
 
+from src.core.config import settings
 from src.db.session import async_session
 from src.services import analytics, sheets
 from src.services.parser import parse_order_message
 from src.services.order_service import process_telegram_order
-from src.db.models import PlatformEnum
+from sqlalchemy import select
+from src.db.models import PlatformEnum, Order, Payment, PaymentStatusEnum
 from src.services import config_service
 from src.services.sheets import check_google_sheets_connection
 
@@ -14,15 +16,38 @@ from src.auth.roles import (
     require_admin,
     require_moderator_or_admin,
     generate_invite_code,
+    generate_admin_invite_code,
     redeem_invite_code,
     add_moderator,
     set_ban_status,
     get_all_moderators,
     get_user_role,
+    get_secondary_admin,
+    remove_secondary_admin,
     RoleEnum
 )
 
 logger = logging.getLogger(__name__)
+
+def get_persistent_keyboard():
+    """Persistent reply keyboard pinned at the bottom of the chat for Admin."""
+    return ReplyKeyboardMarkup([["🏠 Main Menu"]], resize_keyboard=True, is_persistent=True)
+
+
+def get_moderator_persistent_keyboard():
+    """Persistent reply keyboard pinned at the bottom of the chat for Moderators."""
+    return ReplyKeyboardMarkup(
+        [
+            ["🏠 Main Menu", "📊 My Stats Today"],
+            ["📦 Check Stock", "🔍 Search My Orders"],
+            ["⚠️ Report Low Stock"],
+        ],
+        resize_keyboard=True,
+        is_persistent=True
+    )
+
+
+
 
 def get_main_menu_keyboard():
     keyboard = [
@@ -35,9 +60,16 @@ def get_main_menu_keyboard():
             InlineKeyboardButton("📈 Growth", callback_data="cmd_growth"),
             InlineKeyboardButton("🚨 Alerts", callback_data="cmd_alerts")
         ],
-        [InlineKeyboardButton("📋 Recent Orders", callback_data="cmd_orders_all")],
+        [
+            InlineKeyboardButton("📋 Recent Orders", callback_data="cmd_orders_all"),
+            InlineKeyboardButton("🔍 Search Orders", callback_data="cmd_search_prompt")
+        ],
         [InlineKeyboardButton("🏆 Top Product", callback_data="cmd_top")],
         [InlineKeyboardButton("⏳ Pending Orders", callback_data="cmd_pending")],
+        [
+            InlineKeyboardButton("📦 Stock Overview", callback_data="cmd_stock"),
+            InlineKeyboardButton("👥 Team Stats",     callback_data="cmd_team_stats")
+        ],
         [
             InlineKeyboardButton("📊 Google Sheet", callback_data="cmd_check_sheets"),
             InlineKeyboardButton("⚙️ Settings", callback_data="cmd_settings")
@@ -45,10 +77,22 @@ def get_main_menu_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
+def get_moderator_menu_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📊 My Stats Today", callback_data="cmd_my_stats")],
+        [
+            InlineKeyboardButton("📦 Check Stock",      callback_data="cmd_mod_stock"),
+            InlineKeyboardButton("🔍 Search My Orders", callback_data="cmd_mod_search_prompt"),
+        ],
+        [InlineKeyboardButton("⚠️ Report Low Stock", callback_data="cmd_mod_lowstock_prompt")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 def get_settings_keyboard():
     keyboard = [
         [InlineKeyboardButton("🎟️ Generate Invite Link", callback_data="cmd_generate_invite")],
         [InlineKeyboardButton("👥 List Moderators", callback_data="cmd_list_mods")],
+        [InlineKeyboardButton("👑 Admin Management", callback_data="cmd_admin_mgmt")],
         [InlineKeyboardButton("📊 Manage Spreadsheet", callback_data="cmd_manage_sheets")],
         [InlineKeyboardButton("🏠 Back to Main Menu", callback_data="cmd_main_menu")]
     ]
@@ -76,8 +120,13 @@ def get_invite_platform_keyboard():
 
 @require_admin
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    welcome_text = "Welcome to the Multi-Platform Order Tracking Agent 🤖\n\nPlease select an option below:"
-    await update.effective_message.reply_text(welcome_text, reply_markup=get_main_menu_keyboard())
+    # Pin the persistent keyboard at the bottom
+    await update.effective_message.reply_text("📌 Quick access pinned below.", reply_markup=get_persistent_keyboard())
+    # Show the inline dashboard
+    await update.effective_message.reply_text(
+        "Welcome to the Multi-Platform Order Tracking Agent 🤖\n\nPlease select an option below:",
+        reply_markup=get_main_menu_keyboard()
+    )
 
 @require_admin
 async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -112,7 +161,9 @@ async def _do_generate_invite(update: Update, platform: PlatformEnum):
         f"`#ORDER`\n"
         f"`Product: (Write Name Here)`\n"
         f"`Qty: 1`\n"
-        f"`Price: 500`"
+        f"`Price: 500`\n"
+        f"`Phone: 017XXXXXXXX`\n"
+        f"`Status: PAID` _(optional, defaults to PENDING)_"
     )
     
     # Add Main Menu button to the forwarded message for easier navigation
@@ -135,7 +186,23 @@ async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     full_name = update.effective_user.full_name or "Moderator"
     
     result = await redeem_invite_code(user_id, full_name, code)
-    if result is True:
+    if result == RoleEnum.ADMIN:
+        welcome_msg = (
+            f"✅ **Welcome {full_name}!** You have been added as an Admin.\n\n"
+            "You now have full access to the SME Management dashboard.\n\n"
+            "**What you can do:**\n"
+            "• View daily, weekly and monthly sales reports\n"
+            "• Monitor top products and revenue breakdown\n"
+            "• Check pending orders and stock alerts\n"
+            "• Manage moderators (invite, ban, unban)\n"
+            "• Connect and manage Google Sheets\n\n"
+            "Tap the button below to open your dashboard."
+        )
+        # Pin the persistent keyboard first, then show the welcome
+        await update.effective_message.reply_text("📌 Quick access pinned below.", reply_markup=get_persistent_keyboard())
+        menu_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Open Dashboard", callback_data="cmd_main_menu")]])
+        await update.effective_message.reply_text(welcome_msg, parse_mode="Markdown", reply_markup=menu_keyboard)
+    elif result == RoleEnum.MODERATOR:
         welcome_msg = (
             f"✅ **Welcome {full_name}!** You have successfully joined as a Moderator.\n\n"
             "Here is how to use the bot:\n"
@@ -143,11 +210,15 @@ async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "`#ORDER`\n"
             "`Product: Exact Product Name`\n"
             "`Qty: 1`\n"
-            "`Price: 500`\n\n"
+            "`Price: 500`\n"
+            "`Phone: 017XXXXXXXX`\n\n"
             "I will save it and automatically update the Google Sheets database!"
         )
-        menu_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Open Main Menu", callback_data="cmd_main_menu")]])
-        await update.effective_message.reply_text(welcome_msg, parse_mode="Markdown", reply_markup=menu_keyboard)
+        # Show persistent keyboard for moderator
+        await update.effective_message.reply_text("📌 Quick access pinned below.", reply_markup=get_moderator_persistent_keyboard())
+        await update.effective_message.reply_text(welcome_msg, parse_mode="Markdown")
+
+
     else:
         await update.effective_message.reply_text(f"❌ Failed to join: {result}")
 
@@ -279,6 +350,61 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_recent_orders(update, platform=None)
 
+def _order_card_text(order) -> str:
+    """Formats a single order as a readable text block."""
+    status_icon = "✅" if order.payment_status == PaymentStatusEnum.PAID else "⏳"
+    return (
+        f"🆔 `{order.order_id}`\n"
+        f"📦 {order.product_name}\n"
+        f"🔢 Qty: {order.quantity} | 💰 ৳{order.price}\n"
+        f"📱 Phone: {order.phone_number or '—'}\n"
+        f"🌐 {order.platform.value} | {status_icon} {order.payment_status.value}\n"
+        f"🕐 {order.timestamp.strftime('%d %b %Y, %I:%M %p')}"
+    )
+
+def _order_action_keyboard(order_id: str) -> InlineKeyboardMarkup:
+    """Inline buttons for edit and cancel on an order card."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Edit", callback_data=f"cmd_edit_{order_id}"),
+            InlineKeyboardButton("❌ Cancel Order", callback_data=f"cmd_cancel_{order_id}")
+        ]
+    ])
+
+@require_admin
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search orders by product name, phone, or order ID. Usage: /search <query>"""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "🔍 *Order Search*\n\nUsage: `/search <query>`\n\nYou can search by:\n"
+            "• Product name  (e.g. `/search Nike`)\n"
+            "• Phone number  (e.g. `/search 01712`)\n"
+            "• Order ID      (e.g. `/search ORD-225`)",
+            parse_mode="Markdown"
+        )
+        return
+
+    query = " ".join(context.args).strip()
+    async with async_session() as session:
+        orders = await analytics.search_orders(session, query)
+
+    if not orders:
+        await update.effective_message.reply_text(
+            f"🔍 No orders found for *\"{query}\"*.", parse_mode="Markdown",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return
+
+    await update.effective_message.reply_text(
+        f"🔍 *{len(orders)} result(s) for \"{query}\":*", parse_mode="Markdown"
+    )
+    for order in orders:
+        await update.effective_message.reply_text(
+            _order_card_text(order),
+            parse_mode="Markdown",
+            reply_markup=_order_action_keyboard(order.order_id)
+        )
+
 @require_admin
 async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with async_session() as session:
@@ -338,6 +464,38 @@ async def growth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             
         await update.effective_message.reply_markdown(msg, reply_markup=get_main_menu_keyboard())
 
+@require_moderator_or_admin
+async def moderator_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.effective_user.id)
+    async with async_session() as session:
+        stats = await analytics.get_moderator_stats(session, user_id)
+        
+        # Simple gamification: Achievement message
+        achievement = "Keep it up! 🚀"
+        if stats["total_orders"] >= 10:
+            achievement = "Superstar! 🌟 You're on fire today!"
+        elif stats["total_orders"] >= 5:
+            achievement = "Great job! 📈 You're making a real impact!"
+        elif stats["total_orders"] > 0:
+            achievement = "Nice start! 👍 Let's keep those orders coming!"
+
+        msg = (
+            f"📊 **Your Performance Today**\n\n"
+            f"✅ **Total Orders:** {stats['total_orders']}\n"
+            f"💰 **Total Sales:** ৳{stats['total_sales']:,.2f}\n\n"
+            f"_{achievement}_"
+        )
+        
+        reply_markup = get_moderator_menu_keyboard()
+        # Ensure persistent keyboard stays active
+        await update.effective_message.reply_text("📌 Quick access menu active.", reply_markup=get_moderator_persistent_keyboard())
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
+        else:
+            await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
+
+
 @require_admin
 async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with async_session() as session:
@@ -355,17 +513,172 @@ async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.effective_message.reply_markdown(msg, reply_markup=get_main_menu_keyboard())
 
 @require_admin
+async def stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show all products with current stock levels, sales velocity, and days remaining."""
+    async with async_session() as session:
+        products = await analytics.get_all_products(session)
+        predictions = await analytics.get_stock_predictions(session)
+
+    if not products:
+        await update.effective_message.reply_text(
+            "📦 *Stock Overview*\n\nNo products tracked yet.\n\n"
+            "Products are added automatically when orders are submitted.\n"
+            "Use `/setstock <qty> <product>` to set stock levels.",
+            parse_mode="Markdown", reply_markup=get_main_menu_keyboard()
+        )
+        return
+
+    pred_map = {p["product_name"]: p for p in predictions}
+    lines = ["📦 *Stock Overview*\n"]
+    for product in products:
+        p = pred_map.get(product.name, {})
+        stock = product.current_stock
+        velocity = p.get("avg_daily_sales", 0)
+        days = p.get("days_remaining", 999)
+
+        if stock == 0:
+            icon = "⚫"
+            days_str = "—"
+        elif days < 5:
+            icon = "🔴"
+            days_str = f"{days:.1f}d"
+        elif days < 14:
+            icon = "🟡"
+            days_str = f"{days:.1f}d"
+        else:
+            icon = "🟢"
+            days_str = f"{days:.0f}d" if days < 999 else "∞"
+
+        vel_str = f"{velocity:.1f}/day" if velocity > 0 else "no sales"
+        lines.append(f"{icon} *{product.name}*\n   Stock: {stock} | {vel_str} | Left: {days_str}")
+
+    lines.append("\n🔴 Critical  🟡 Low  🟢 OK  ⚫ Not set")
+    lines.append("Use `/setstock <qty> <product>` to update stock.")
+
+    await update.effective_message.reply_text(
+        "\n".join(lines), parse_mode="Markdown", reply_markup=get_main_menu_keyboard()
+    )
+
+
+@require_admin
+async def team_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show per-moderator order and sales stats."""
+    async with async_session() as session:
+        stats = await analytics.get_all_moderators_stats(session)
+
+    if not stats:
+        await update.effective_message.reply_text(
+            "👥 *Team Stats*\n\nNo active moderators found.",
+            parse_mode="Markdown", reply_markup=get_main_menu_keyboard()
+        )
+        return
+
+    lines = ["👥 *Team Performance*\n"]
+    for idx, m in enumerate(stats, 1):
+        plat_icon = {"FACEBOOK": "🟦", "WHATSAPP": "🟢", "TELEGRAM": "🔵"}.get(m["platform"], "🌐")
+        lines.append(
+            f"{idx}. {plat_icon} *{m['name']}*\n"
+            f"   Today:    {m['today_orders']} orders · ৳{m['today_sales']:,.0f}\n"
+            f"   7 days:   {m['week_orders']} orders · ৳{m['week_sales']:,.0f}\n"
+            f"   All-time: {m['alltime_orders']} orders · ৳{m['alltime_sales']:,.0f}"
+        )
+
+    await update.effective_message.reply_text(
+        "\n".join(lines), parse_mode="Markdown", reply_markup=get_main_menu_keyboard()
+    )
+
+
+@require_admin
+async def setstock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set stock for a product. Usage: /setstock <quantity> <product name>"""
+    if not context.args or len(context.args) < 2:
+        await update.effective_message.reply_text(
+            "❌ Usage: `/setstock <quantity> <product name>`\n\nExample: `/setstock 50 Nike Air Max`",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        quantity = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Quantity must be a number. Example: `/setstock 50 Nike Air Max`", parse_mode="Markdown")
+        return
+
+    product_name = " ".join(context.args[1:])
+
+    async with async_session() as session:
+        from sqlalchemy import select
+        from src.db.models import Product
+        result = await session.execute(select(Product).where(Product.name == product_name))
+        product = result.scalar_one_or_none()
+        if product:
+            product.current_stock = quantity
+        else:
+            session.add(Product(name=product_name, current_stock=quantity))
+        await session.commit()
+
+    await update.effective_message.reply_text(
+        f"✅ Stock updated!\n\n*{product_name}*: {quantity} units",
+        parse_mode="Markdown",
+        reply_markup=get_main_menu_keyboard()
+    )
+
+@require_admin
 async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with async_session() as session:
         orders = await analytics.get_pending_orders(session, limit=5)
         if not orders:
-            await update.effective_message.reply_text("No pending orders found.", reply_markup=get_main_menu_keyboard())
+            await update.effective_message.reply_text("✅ No pending orders found.", reply_markup=get_main_menu_keyboard())
             return
-            
-        text = "⏳ *Recent Pending Orders*\n\n"
+
         for o in orders:
-            text += f"ID: {o.order_id}\nProduct: {o.product_name} (৳{o.price})\nPlatform: {o.platform.value}\n---\n"
-        await update.effective_message.reply_markdown(text, reply_markup=get_main_menu_keyboard())
+            text = (
+                f"⏳ *Pending Order*\n"
+                f"ID: `{o.order_id}`\n"
+                f"Product: {o.product_name}\n"
+                f"Qty: {o.quantity} | Price: ৳{o.price}\n"
+                f"Platform: {o.platform.value}"
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Mark as Paid", callback_data=f"cmd_markpaid_{o.order_id}")]
+            ])
+            await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+@require_admin
+async def markpaid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually mark an order as paid. Usage: /markpaid <order_id>"""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "❌ Usage: `/markpaid <order_id>`\n\nExample: `/markpaid ORD-12345`",
+            parse_mode="Markdown"
+        )
+        return
+
+    order_id = context.args[0].strip()
+    async with async_session() as session:
+        result = await session.execute(select(Order).where(Order.order_id == order_id))
+        order = result.scalar_one_or_none()
+
+        if not order:
+            await update.effective_message.reply_text(f"❌ Order `{order_id}` not found.", parse_mode="Markdown")
+            return
+
+        if order.payment_status == PaymentStatusEnum.PAID:
+            await update.effective_message.reply_text(f"ℹ️ Order `{order_id}` is already marked as PAID.", parse_mode="Markdown")
+            return
+
+        order.payment_status = PaymentStatusEnum.PAID
+        session.add(Payment(sender_phone="manual", amount=float(order.price), matched_order_id=order.id))
+        await session.commit()
+
+        import asyncio
+        asyncio.create_task(sheets.update_payment_status_in_sheets(order_id, "PAID"))
+
+    await update.effective_message.reply_text(
+        f"✅ *Order Marked as Paid*\n\nID: `{order_id}`\nProduct: {order.product_name}\nAmount: ৳{order.price}",
+        parse_mode="Markdown",
+        reply_markup=get_main_menu_keyboard()
+    )
 
 async def _send_sheets_check(update: Update, edit: bool = False):
     sheet_name = await config_service.get_active_sheet_name()
@@ -433,12 +746,36 @@ async def _send_sheets_check(update: Update, edit: bool = False):
 async def check_sheets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_sheets_check(update, edit=False)
 
-@require_admin
+@require_moderator_or_admin
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     logger.info(f"Button clicked: {query.data}")
     
+    user_id = str(query.from_user.id)
+    from src.auth.roles import get_user_role, RoleEnum
+    role = await get_user_role(user_id)
+    
+    # List of commands that are strictly for Admins only
+    admin_only_prefixes = [
+        "cmd_today_", "cmd_orders_", "cmd_top", "cmd_pending",
+        "cmd_weekly", "cmd_monthly", "cmd_growth", "cmd_alerts",
+        "cmd_check_sheets", "cmd_settings", "cmd_generate_invite",
+        "cmd_gen_invite_", "cmd_list_mods", "cmd_manage_bans",
+        "cmd_prompt_", "cmd_admin_mgmt", "cmd_gen_admin_invite",
+        "cmd_remove_admin_", "cmd_manage_sheets",
+    ]
+    
+    is_admin_cmd = False
+    for prefix in admin_only_prefixes:
+        if query.data.startswith(prefix):
+            is_admin_cmd = True
+            break
+            
+    if is_admin_cmd and role != RoleEnum.ADMIN:
+        await query.answer("⛔ Access Denied. Admin privileges required.", show_alert=True)
+        return
+
     if query.data == "cmd_today_all":
         await _send_today_sales(update, platform=None)
     elif query.data == "cmd_today_FACEBOOK":
@@ -455,6 +792,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await top_command(update, context)
     elif query.data == "cmd_pending":
         await pending_command(update, context)
+    elif query.data == "cmd_stock":
+        await stock_command(update, context)
+    elif query.data == "cmd_team_stats":
+        await team_stats_command(update, context)
     elif query.data == "cmd_weekly":
         await weekly_command(update, context)
     elif query.data == "cmd_monthly":
@@ -510,8 +851,102 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="cmd_manage_bans")]])
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    elif query.data == "cmd_my_stats":
+        await moderator_stats_command(update, context)
+
+    # --- Moderator: Check Stock ---
+    elif query.data == "cmd_mod_stock":
+        await mod_stock_command(update, context)
+
+    # --- Moderator: Search My Orders prompt ---
+    elif query.data == "cmd_mod_search_prompt":
+        context.user_data["awaiting_mod_search"] = True
+        await query.edit_message_text(
+            "🔍 *Search My Orders*\n\nType your search term and send it:\n\n"
+            "• Product name  (e.g. `Nike`)\n"
+            "• Phone number  (e.g. `01712`)\n"
+            "• Order ID      (e.g. `ORD-225`)",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]])
+        )
+
+    # --- Moderator: Report Low Stock prompt ---
+    elif query.data == "cmd_mod_lowstock_prompt":
+        context.user_data["awaiting_mod_lowstock"] = True
+        await query.edit_message_text(
+            "⚠️ *Report Low Stock*\n\nType the product name and send it.\n"
+            "The admin will be notified immediately.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]])
+        )
+
     elif query.data == "cmd_main_menu":
-        await query.edit_message_text("Welcome to the Multi-Platform Order Tracking Agent 🤖\n\nPlease select an option below:", reply_markup=get_main_menu_keyboard())
+        user_id = str(query.from_user.id)
+        role = await get_user_role(user_id)
+        if role == RoleEnum.ADMIN:
+            await query.edit_message_text("Welcome to the Multi-Platform Order Tracking Agent 🤖\n\nPlease select an option below:", reply_markup=get_main_menu_keyboard())
+        else:
+            await query.edit_message_text("Welcome back! Use the button below to check your stats or just send an #ORDER.", reply_markup=get_moderator_menu_keyboard())
+
+    elif query.data == "cmd_admin_mgmt":
+        if str(query.from_user.id) != str(settings.TELEGRAM_CHAT_ID):
+            await query.answer("⛔ Only the primary admin can manage admin access.", show_alert=True)
+            return
+        secondary = await get_secondary_admin()
+        if secondary:
+            text = (
+                f"👑 *Admin Management*\n\n"
+                f"Current Secondary Admin:\n"
+                f"👤 *{secondary['name']}*\n"
+                f"ID: `{secondary['id']}`\n\n"
+                f"You can remove them if needed."
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑️ Remove Secondary Admin", callback_data=f"cmd_remove_admin_{secondary['id']}")],
+                [InlineKeyboardButton("🔙 Back to Settings", callback_data="cmd_settings")]
+            ])
+        else:
+            text = (
+                "👑 *Admin Management*\n\n"
+                "No secondary admin assigned yet.\n\n"
+                "You can invite one trusted person to have full admin access.\n"
+                "_(Only 1 secondary admin is allowed at a time)_"
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Generate Admin Invite", callback_data="cmd_gen_admin_invite")],
+                [InlineKeyboardButton("🔙 Back to Settings", callback_data="cmd_settings")]
+            ])
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif query.data == "cmd_gen_admin_invite":
+        code = await generate_admin_invite_code()
+        if code is None:
+            await query.answer("⚠️ A secondary admin already exists. Remove them first.", show_alert=True)
+        else:
+            forward_msg = (
+                f"👑 *You have been invited as an Admin!*\n\n"
+                f"Open the bot @SME\\_management\\_bot and send:\n"
+                f"`/join {code}`\n\n"
+                f"This code can only be used once."
+            )
+            await query.edit_message_text(
+                f"✅ *Admin Invite Generated!*\n\nForward the message below to your new admin:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="cmd_admin_mgmt")]])
+            )
+            await query.message.reply_text(forward_msg, parse_mode="Markdown")
+
+    elif query.data.startswith("cmd_remove_admin_"):
+        admin_id = query.data.replace("cmd_remove_admin_", "")
+        success = await remove_secondary_admin(admin_id)
+        if success:
+            await query.edit_message_text(
+                "✅ *Secondary admin removed successfully.*",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Settings", callback_data="cmd_settings")]])
+            )
+        else:
+            await query.answer("❌ Could not remove admin.", show_alert=True)
 
     elif query.data == "cmd_manage_sheets":
         sheet_name = await config_service.get_active_sheet_name()
@@ -546,21 +981,382 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_manage_sheets")]])
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
+    elif query.data.startswith("cmd_markpaid_"):
+        order_id = query.data.replace("cmd_markpaid_", "")
+        price = None
+
+        async with async_session() as session:
+            result = await session.execute(select(Order).where(Order.order_id == order_id))
+            order = result.scalar_one_or_none()
+
+            if not order:
+                await query.answer("❌ Order not found.", show_alert=True)
+                return
+
+            # Moderators can only mark their own orders as paid
+            if role != RoleEnum.ADMIN and order.created_by_id != user_id:
+                await query.answer("⛔ You can only mark your own orders as paid.", show_alert=True)
+                return
+
+            if order.payment_status == PaymentStatusEnum.PAID:
+                await query.answer("ℹ️ Already marked as PAID.", show_alert=True)
+                return
+
+            price = float(order.price)
+
+            order.payment_status = PaymentStatusEnum.PAID
+            session.add(Payment(sender_phone="manual", amount=price, matched_order_id=order.id))
+            await session.commit()
+            await session.refresh(order)
+
+            import asyncio
+            asyncio.create_task(sheets.update_payment_status_in_sheets(order_id, "PAID"))
+
+            card = _order_card_text(order)
+
+        await query.edit_message_text(
+            f"✅ *Marked as Paid!*\n\n{card}",
+            parse_mode="Markdown",
+            reply_markup=_order_action_keyboard(order_id)
+        )
+
+    # --- Search prompt (from main menu button) ---
+    elif query.data == "cmd_search_prompt":
+        context.user_data["awaiting_search"] = True
+        await query.edit_message_text(
+            "🔍 *Order Search*\n\nType your search term and send it:\n\n"
+            "• Product name  (e.g. `Nike`)\n"
+            "• Phone number  (e.g. `01712`)\n"
+            "• Order ID      (e.g. `ORD-225`)",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]])
+        )
+
+    # --- Edit order: show field selection ---
+    elif query.data.startswith("cmd_edit_"):
+        order_id = query.data.replace("cmd_edit_", "")
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📦 Product", callback_data=f"cmd_ef_{order_id}_product"),
+                InlineKeyboardButton("🔢 Qty",     callback_data=f"cmd_ef_{order_id}_qty"),
+            ],
+            [
+                InlineKeyboardButton("💰 Price",   callback_data=f"cmd_ef_{order_id}_price"),
+                InlineKeyboardButton("📱 Phone",   callback_data=f"cmd_ef_{order_id}_phone"),
+            ],
+            [InlineKeyboardButton("✅ Status → PAID", callback_data=f"cmd_ef_{order_id}_markpaid")],
+            [InlineKeyboardButton("↩️ Back to Order", callback_data=f"cmd_view_order_{order_id}")]
+        ])
+        await query.edit_message_text(
+            f"✏️ *Edit Order `{order_id}`*\n\nWhich field do you want to change?",
+            parse_mode="Markdown", reply_markup=keyboard
+        )
+
+    # --- Edit order: capture field, ask for new value ---
+    elif query.data.startswith("cmd_ef_"):
+        raw = query.data[len("cmd_ef_"):]          # e.g. "ORD-225_price"
+        field = raw.rsplit("_", 1)[-1]              # last segment = field
+        order_id = raw[: -(len(field) + 1)]         # everything before last _<field>
+
+        if field == "markpaid":
+            async with async_session() as session:
+                result = await session.execute(select(Order).where(Order.order_id == order_id))
+                order = result.scalar_one_or_none()
+                if order and order.payment_status != PaymentStatusEnum.PAID:
+                    order.payment_status = PaymentStatusEnum.PAID
+                    session.add(Payment(sender_phone="manual", amount=float(order.price), matched_order_id=order.id))
+                    await session.commit()
+                    await session.refresh(order)
+                if order:
+                    card = _order_card_text(order)
+                    import asyncio
+                    asyncio.create_task(sheets.update_payment_status_in_sheets(order_id, "PAID"))
+                else:
+                    card = f"Order `{order_id}` not found."
+            await query.edit_message_text(
+                f"✅ *Marked as Paid!*\n\n{card}",
+                parse_mode="Markdown",
+                reply_markup=_order_action_keyboard(order_id)
+            )
+            return
+
+        field_labels = {"product": "product name", "qty": "quantity", "price": "price", "phone": "phone number"}
+
+        # Fetch current value to show in the prompt
+        async with async_session() as session:
+            result = await session.execute(select(Order).where(Order.order_id == order_id))
+            order = result.scalar_one_or_none()
+
+        current_values = {
+            "product": order.product_name if order else "—",
+            "qty":     str(order.quantity) if order else "—",
+            "price":   str(int(order.price)) if order else "—",
+            "phone":   order.phone_number or "—" if order else "—",
+        }
+        current_labels = {
+            "product": "Current product",
+            "qty":     "Current quantity",
+            "price":   "Current price",
+            "phone":   "Current phone",
+        }
+        current = current_values.get(field, "—")
+        current_label = current_labels.get(field, "Current value")
+
+        context.user_data["editing_order_id"] = order_id
+        context.user_data["editing_field"] = field
+        await query.edit_message_text(
+            f"✏️ *Edit `{field_labels.get(field, field)}` for order `{order_id}`*\n\n"
+            f"{current_label}: `{current}`\n\n"
+            f"Send the new value now:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Edit", callback_data=f"cmd_view_order_{order_id}")]])
+        )
+
+    # --- View order card (used by Cancel Edit to restore the order) ---
+    elif query.data.startswith("cmd_view_order_"):
+        order_id = query.data.replace("cmd_view_order_", "")
+        # Clear any stale edit state
+        context.user_data.pop("editing_order_id", None)
+        context.user_data.pop("editing_field", None)
+        async with async_session() as session:
+            result = await session.execute(select(Order).where(Order.order_id == order_id))
+            order = result.scalar_one_or_none()
+        if not order:
+            await query.edit_message_text(f"❌ Order `{order_id}` not found.", parse_mode="Markdown")
+        else:
+            await query.edit_message_text(
+                _order_card_text(order),
+                parse_mode="Markdown",
+                reply_markup=_order_action_keyboard(order_id)
+            )
+
+    # --- Cancel order: confirm step ---
+    elif query.data.startswith("cmd_cancel_"):
+        order_id = query.data.replace("cmd_cancel_", "")
+        await query.edit_message_text(
+            f"⚠️ *Cancel Order `{order_id}`?*\n\nThis will permanently delete the order.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑️ Yes, Delete It", callback_data=f"cmd_confirmcancel_{order_id}")],
+                [InlineKeyboardButton("↩️ No, Keep It",   callback_data="cmd_main_menu")]
+            ])
+        )
+
+    # --- Cancel order: confirmed, delete ---
+    elif query.data.startswith("cmd_confirmcancel_"):
+        order_id = query.data.replace("cmd_confirmcancel_", "")
+        async with async_session() as session:
+            result = await session.execute(select(Order).where(Order.order_id == order_id))
+            order = result.scalar_one_or_none()
+            if not order:
+                await query.answer("❌ Order not found.", show_alert=True)
+                return
+            await session.delete(order)
+            await session.commit()
+        await query.edit_message_text(
+            f"🗑️ Order `{order_id}` has been cancelled and removed.",
+            parse_mode="Markdown"
+        )
+
 
 # --- Order Processing (Moderator & Admin) ---
+
+@require_moderator_or_admin
+async def mod_stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show available product stock for moderators (read-only, no business metrics)."""
+    async with async_session() as session:
+        products = await analytics.get_all_products(session)
+
+    if not products:
+        msg = (
+            "📦 *Stock Status*\n\n"
+            "No products tracked yet.\n"
+            "Products appear here automatically after orders are submitted."
+        )
+    else:
+        lines = ["📦 *Stock Status*\n"]
+        for p in products:
+            if p.current_stock == 0:
+                icon, status = "🔴", "Out of stock"
+            elif p.current_stock <= 10:
+                icon, status = "🟡", f"Low — {p.current_stock} left"
+            else:
+                icon, status = "🟢", f"{p.current_stock} available"
+            lines.append(f"{icon} *{p.name}* — {status}")
+        msg = "\n".join(lines)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, parse_mode="Markdown")
+    else:
+        await update.effective_message.reply_text(msg, parse_mode="Markdown")
+
+
+@require_moderator_or_admin
+async def lowstock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Moderator reports a low stock product to admin. Usage: /lowstock <product name>"""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "⚠️ Usage: `/lowstock <product name>`\n\nExample: `/lowstock Nike Air Max`",
+            parse_mode="Markdown"
+        )
+        return
+
+    product_name = " ".join(context.args).strip()
+    reporter_name = update.effective_user.full_name or "A moderator"
+
+    from src.services.notifier import send_admin_alert
+    await send_admin_alert(
+        f"⚠️ *Low Stock Report*\n\n"
+        f"*{reporter_name}* reported low stock for:\n"
+        f"📦 *{product_name}*\n\n"
+        f"Use `/setstock <qty> {product_name}` to update."
+    )
+    await update.effective_message.reply_text(
+        f"✅ Admin has been notified about low stock for *{product_name}*.",
+        parse_mode="Markdown",
+        reply_markup=get_moderator_menu_keyboard()
+    )
+
 
 @require_moderator_or_admin
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Processes incoming text messages for orders."""
     text = update.effective_message.text
-    if not text or not text.strip().upper().startswith("#ORDER"):
-        from src.auth.roles import get_user_role
-        from src.db.models import RoleEnum
-        
+
+    # Handle persistent keyboard "Main Menu" button tap
+    if text and text.strip() == "🏠 Main Menu":
         user_id = str(update.effective_user.id)
         role = await get_user_role(user_id)
-        
         if role == RoleEnum.ADMIN:
+            await update.effective_message.reply_text("📌 Quick access menu updated.", reply_markup=get_persistent_keyboard())
+            await update.effective_message.reply_text(
+                "Welcome to the Multi-Platform Order Tracking Agent 🤖\n\nPlease select an option below:",
+                reply_markup=get_main_menu_keyboard()
+            )
+        else:
+            await update.effective_message.reply_text("📌 Quick access menu updated.", reply_markup=get_moderator_persistent_keyboard())
+            await update.effective_message.reply_text(
+                "Welcome back! Send an #ORDER or use the button below to check your stats.",
+                reply_markup=get_moderator_menu_keyboard()
+            )
+        return
+
+    # Handle persistent keyboard "My Stats Today" button tap (Moderator)
+    if text and text.strip() == "📊 My Stats Today":
+        await moderator_stats_command(update, context)
+        return
+
+    # Handle persistent keyboard "Check Stock" button tap (Moderator)
+    if text and text.strip() == "📦 Check Stock":
+        await mod_stock_command(update, context)
+        return
+
+    # Handle persistent keyboard "Search My Orders" button tap (Moderator)
+    if text and text.strip() == "🔍 Search My Orders":
+        context.user_data["awaiting_mod_search"] = True
+        await update.effective_message.reply_text(
+            "🔍 *Search My Orders*\n\nType your search term and send it:\n\n"
+            "• Product name  (e.g. `Nike`)\n"
+            "• Phone number  (e.g. `01712`)\n"
+            "• Order ID      (e.g. `ORD-225`)",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Handle persistent keyboard "Report Low Stock" button tap (Moderator)
+    if text and text.strip() == "⚠️ Report Low Stock":
+        context.user_data["awaiting_mod_lowstock"] = True
+        await update.effective_message.reply_text(
+            "⚠️ *Report Low Stock*\n\nType the product name and send it.\n"
+            "The admin will be notified immediately.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Handle persistent keyboard "Today's Sales" button tap (Admin)
+    if text and text.strip() == "📊 Today's Sales":
+        user_id = str(update.effective_user.id)
+        role = await get_user_role(user_id)
+        if role == RoleEnum.ADMIN:
+            await today_command(update, context)
+        return
+
+    if not text or not text.strip().upper().startswith("#ORDER"):
+        user_id = str(update.effective_user.id)
+        role = await get_user_role(user_id)
+
+        # --- Handle awaiting edit value (both Admin and Moderator) ---
+        if context.user_data.get("editing_order_id"):
+            order_id = context.user_data.pop("editing_order_id")
+            field    = context.user_data.pop("editing_field")
+            new_val  = text.strip()
+
+            async with async_session() as session:
+                result = await session.execute(select(Order).where(Order.order_id == order_id))
+                order = result.scalar_one_or_none()
+                if not order:
+                    await update.effective_message.reply_text(f"❌ Order `{order_id}` not found.", parse_mode="Markdown")
+                    return
+                # Moderators can only edit their own orders
+                if role != RoleEnum.ADMIN and order.created_by_id != user_id:
+                    await update.effective_message.reply_text("⛔ You can only edit your own orders.", parse_mode="Markdown")
+                    return
+                try:
+                    if field == "product":
+                        order.product_name = new_val
+                    elif field == "qty":
+                        order.quantity = int(new_val)
+                    elif field == "price":
+                        order.price = float(new_val)
+                    elif field == "phone":
+                        order.phone_number = new_val
+                    else:
+                        await update.effective_message.reply_text("❌ Unknown field.", parse_mode="Markdown")
+                        return
+                    await session.commit()
+                    await session.refresh(order)
+                    card = _order_card_text(order)
+                except (ValueError, TypeError):
+                    await update.effective_message.reply_text(
+                        f"❌ Invalid value `{new_val}` for *{field}*. Please try again.",
+                        parse_mode="Markdown"
+                    )
+                    return
+
+            # Sync the changed field to Google Sheets in the background
+            import asyncio as _asyncio
+            _asyncio.create_task(sheets.update_order_field_in_sheets(order_id, field, new_val))
+
+            await update.effective_message.reply_text(
+                f"✅ *Order updated!*\n\n{card}",
+                parse_mode="Markdown",
+                reply_markup=_order_action_keyboard(order_id)
+            )
+            return
+
+        if role == RoleEnum.ADMIN:
+            # --- Handle awaiting search query ---
+            if context.user_data.get("awaiting_search"):
+                context.user_data["awaiting_search"] = False
+                query_str = text.strip()
+                async with async_session() as session:
+                    orders = await analytics.search_orders(session, query_str)
+                if not orders:
+                    await update.effective_message.reply_text(
+                        f"🔍 No orders found for *\"{query_str}\"*.", parse_mode="Markdown",
+                        reply_markup=get_main_menu_keyboard()
+                    )
+                    return
+                await update.effective_message.reply_text(
+                    f"🔍 *{len(orders)} result(s) for \"{query_str}\":*", parse_mode="Markdown"
+                )
+                for order in orders:
+                    await update.effective_message.reply_text(
+                        _order_card_text(order), parse_mode="Markdown",
+                        reply_markup=_order_action_keyboard(order.order_id)
+                    )
+                return
+
             # Check if we are waiting for a spreadsheet name
             if context.user_data.get("awaiting_sheet_name"):
                 sheet_name = text.strip()
@@ -587,6 +1383,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Open Main Menu", callback_data="cmd_main_menu")]])
             await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=keyboard)
         else:
+            # --- Moderator: awaiting search query ---
+            if context.user_data.get("awaiting_mod_search"):
+                context.user_data["awaiting_mod_search"] = False
+                query_str = text.strip()
+                async with async_session() as session:
+                    orders = await analytics.search_my_orders(session, query_str, user_id)
+                if not orders:
+                    await update.effective_message.reply_text(
+                        f"🔍 No orders found for *\"{query_str}\"*.",
+                        parse_mode="Markdown", reply_markup=get_moderator_menu_keyboard()
+                    )
+                    return
+                await update.effective_message.reply_text(
+                    f"🔍 *{len(orders)} result(s) for \"{query_str}\":*", parse_mode="Markdown"
+                )
+                for order in orders:
+                    await update.effective_message.reply_text(
+                        _order_card_text(order), parse_mode="Markdown"
+                    )
+                return
+
+            # --- Moderator: awaiting low stock product name ---
+            if context.user_data.get("awaiting_mod_lowstock"):
+                context.user_data["awaiting_mod_lowstock"] = False
+                product_name = text.strip()
+                reporter_name = update.effective_user.full_name or "A moderator"
+                from src.services.notifier import send_admin_alert
+                await send_admin_alert(
+                    f"⚠️ *Low Stock Report*\n\n"
+                    f"*{reporter_name}* reported low stock for:\n"
+                    f"📦 *{product_name}*\n\n"
+                    f"Use `/setstock <qty> {product_name}` to update."
+                )
+                await update.effective_message.reply_text(
+                    f"✅ Admin notified about low stock for *{product_name}*.",
+                    parse_mode="Markdown", reply_markup=get_moderator_menu_keyboard()
+                )
+                return
+
             msg = (
                 "🤔 **I didn't quite understand that.**\n\n"
                 "If you are trying to submit a new order, please make sure your message begins exactly with `#ORDER`.\n\n"
@@ -597,20 +1432,67 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     parsed = parse_order_message(text)
     if not parsed:
-        await update.effective_message.reply_text("❌ Invalid order format. Please use:\n#ORDER\nProduct: ...\nQty: ...\nPrice: ...\nStatus: PAID/PENDING (Optional)")
+        await update.effective_message.reply_text(
+            "❌ *Invalid order format.* Please use:\n\n"
+            "`#ORDER`\n"
+            "`Product: Exact Product Name`\n"
+            "`Qty: 1`\n"
+            "`Price: 500`\n"
+            "`Phone: 017XXXXXXXX`\n"
+            "`Status: PAID` _(optional, defaults to PENDING)_",
+            parse_mode="Markdown"
+        )
         return
 
     user_id = str(update.effective_user.id)
-    from src.auth.roles import get_user_platform
+    from src.auth.roles import get_user_platform, get_user_role as _get_role
     user_platform = await get_user_platform(user_id)
-    
-    # Priority: 1. Tag in message (#FB, #WA), 2. User's default platform
+
+    # Priority: 1. Tag in message (#FB, #WA), 2. User's assigned platform
     final_platform = parsed.platform or user_platform
 
+    # If platform still unknown, admin defaults to TELEGRAM; moderator must tag
+    if final_platform is None:
+        user_role = await _get_role(user_id)
+        if user_role == RoleEnum.ADMIN:
+            final_platform = PlatformEnum.TELEGRAM
+        else:
+            await update.effective_message.reply_text(
+                "❌ *Platform Not Set*\n\n"
+                "Your account has no platform assigned. Add a tag to your order:\n\n"
+                "`#WA` for WhatsApp orders\n"
+                "`#FB` for Facebook orders\n\n"
+                "Example:\n"
+                "`#ORDER #WA`\n"
+                "`Product: ...`\n"
+                "`Qty: ...`\n"
+                "`Price: ...`",
+                parse_mode="Markdown"
+            )
+            return
+
     async with async_session() as session:
-        new_order = await process_telegram_order(parsed, update.effective_message.message_id, session, platform=final_platform)
+        new_order = await process_telegram_order(parsed, update.effective_message.message_id, session, platform=final_platform, created_by_id=user_id)
         
         if new_order:
-            await update.effective_message.reply_text(f"✅ Order Added Successfully\nID: {new_order.order_id}")
+            status_icon = "✅ PAID" if new_order.payment_status.value == "PAID" else "⏳ PENDING"
+            confirm_msg = (
+                f"✅ *Order Saved Successfully!*\n\n"
+                f"🆔 ID: `{new_order.order_id}`\n"
+                f"📦 Product: {new_order.product_name}\n"
+                f"🔢 Qty: {new_order.quantity}  |  💰 ৳{float(new_order.price):,.0f}\n"
+                f"📱 Phone: {new_order.phone_number or '—'}\n"
+                f"🌐 Platform: {new_order.platform.value}\n"
+                f"💳 Status: {status_icon}\n"
+                f"🕐 {new_order.timestamp.strftime('%d %b %Y, %I:%M %p')}"
+            )
+            # Build action buttons based on payment status
+            action_buttons = [InlineKeyboardButton("✏️ Edit Order", callback_data=f"cmd_edit_{new_order.order_id}")]
+            if new_order.payment_status.value == "PENDING":
+                action_buttons.insert(0, InlineKeyboardButton("✅ Mark as Paid", callback_data=f"cmd_markpaid_{new_order.order_id}"))
+            confirm_keyboard = InlineKeyboardMarkup([action_buttons])
+            await update.effective_message.reply_text(
+                confirm_msg, parse_mode="Markdown", reply_markup=confirm_keyboard
+            )
         else:
             await update.effective_message.reply_text("❌ Failed to process order!")

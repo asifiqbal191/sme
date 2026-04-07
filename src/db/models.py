@@ -42,12 +42,13 @@ class User(Base):
 
 class Invite(Base):
     __tablename__ = "invites"
-    
+
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     code: Mapped[str] = mapped_column(String(50), unique=True, index=True)
     is_used: Mapped[bool] = mapped_column(Boolean, default=False)
     used_by: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     platform: Mapped[Optional[PlatformEnum]] = mapped_column(SAEnum(PlatformEnum), nullable=True)
+    role: Mapped[RoleEnum] = mapped_column(SAEnum(RoleEnum), default=RoleEnum.MODERATOR)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_local)
 
 class Order(Base):
@@ -61,6 +62,7 @@ class Order(Base):
     platform: Mapped[PlatformEnum] = mapped_column(SAEnum(PlatformEnum))
     payment_status: Mapped[PaymentStatusEnum] = mapped_column(SAEnum(PaymentStatusEnum), default=PaymentStatusEnum.PENDING)
     phone_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    created_by_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=now_local)
 
 class Payment(Base):

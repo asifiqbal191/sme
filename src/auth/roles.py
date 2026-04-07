@@ -65,35 +65,87 @@ def require_moderator_or_admin(func):
 async def generate_invite_code(platform: PlatformEnum = None) -> str:
     code = f"INV-{secrets.token_hex(4).upper()}"
     async with async_session() as session:
-        invite = Invite(code=code, platform=platform)
+        invite = Invite(code=code, platform=platform, role=RoleEnum.MODERATOR)
+        session.add(invite)
+        await session.commit()
+    return code
+
+async def generate_admin_invite_code() -> str | None:
+    """Generates a one-time admin invite. Returns None if a secondary admin already exists."""
+    async with async_session() as session:
+        existing = await session.execute(
+            select(User).where(User.role == RoleEnum.ADMIN, User.telegram_id != settings.TELEGRAM_CHAT_ID)
+        )
+        if existing.scalar_one_or_none():
+            return None  # Already has a secondary admin
+
+        code = f"ADM-{secrets.token_hex(4).upper()}"
+        invite = Invite(code=code, role=RoleEnum.ADMIN)
         session.add(invite)
         await session.commit()
     return code
 
 async def redeem_invite_code(telegram_id: str, full_name: str, code: str) -> bool | str:
-    """Returns True if succesful, or an error string."""
+    """Returns True if successful, or an error string."""
     async with async_session() as session:
         # Check if invite is valid
         result = await session.execute(select(Invite).where(Invite.code == code, Invite.is_used == False))
         invite = result.scalar_one_or_none()
         if not invite:
             return "Invalid or already used invite code."
-            
+
         # Check if user already exists
         user_result = await session.execute(select(User).where(User.telegram_id == telegram_id))
         user = user_result.scalar_one_or_none()
         if user:
             return "You are already registered."
-            
-        # Mark invite and create user
+
+        # For admin invites, enforce max 1 secondary admin
+        if invite.role == RoleEnum.ADMIN:
+            existing = await session.execute(
+                select(User).where(User.role == RoleEnum.ADMIN, User.telegram_id != settings.TELEGRAM_CHAT_ID)
+            )
+            if existing.scalar_one_or_none():
+                return "Admin slot is already filled. Contact your primary admin."
+
+        # Mark invite and create user with the role from the invite
+        assigned_role = invite.role
         invite.is_used = True
         invite.used_by = telegram_id
-        
-        new_user = User(telegram_id=telegram_id, full_name=full_name, role=RoleEnum.MODERATOR, platform=invite.platform)
+
+        new_user = User(telegram_id=telegram_id, full_name=full_name, role=assigned_role, platform=invite.platform)
         session.add(new_user)
         session.add(invite)
         await session.commit()
-        return True
+        return assigned_role
+
+async def get_secondary_admin() -> dict | None:
+    """Returns the secondary admin (non-primary) if one exists."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(User).where(User.role == RoleEnum.ADMIN, User.telegram_id != settings.TELEGRAM_CHAT_ID)
+        )
+        user = result.scalar_one_or_none()
+        if user:
+            return {"id": user.telegram_id, "name": user.full_name or "Unknown"}
+        return None
+
+async def remove_secondary_admin(telegram_id: str) -> bool:
+    """Removes a secondary admin. Cannot remove the primary admin."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(User).where(
+                User.telegram_id == telegram_id,
+                User.role == RoleEnum.ADMIN,
+                User.telegram_id != settings.TELEGRAM_CHAT_ID
+            )
+        )
+        user = result.scalar_one_or_none()
+        if user:
+            await session.delete(user)
+            await session.commit()
+            return True
+        return False
 
 async def add_moderator(telegram_id: str, full_name: str = None) -> bool:
     async with async_session() as session:
@@ -128,11 +180,11 @@ async def get_all_moderators() -> list[dict]:
             "is_banned": u.is_banned
         } for u in users]
 
-async def get_user_platform(telegram_id: str) -> PlatformEnum:
-    """Gets the platform of the specific user, defaulting to TELEGRAM if none is found."""
+async def get_user_platform(telegram_id: str) -> PlatformEnum | None:
+    """Gets the platform of the specific user. Returns None if not set."""
     async with async_session() as session:
         result = await session.execute(select(User).where(User.telegram_id == telegram_id))
         user = result.scalar_one_or_none()
         if user and user.platform:
             return user.platform
-        return PlatformEnum.TELEGRAM
+        return None

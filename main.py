@@ -1,6 +1,7 @@
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from sqlalchemy import text
 from src.core.config import settings
 from src.db.session import engine
 from src.db.models import Base
@@ -25,6 +26,18 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing database schema...")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Migration: add role column to invites if it doesn't exist (SQLite doesn't auto-add columns)
+        try:
+            await conn.execute(text("ALTER TABLE invites ADD COLUMN role VARCHAR DEFAULT 'MODERATOR'"))
+            logger.info("Migration: added 'role' column to invites table.")
+        except Exception:
+            pass
+            
+        try:
+            await conn.execute(text("ALTER TABLE orders ADD COLUMN created_by_id VARCHAR"))
+            logger.info("Migration: added 'created_by_id' column to orders table.")
+        except Exception:
+            pass  # Column already exists, safe to ignore
         
     logger.info("Starting up Telegram Bot...")
     if settings.TELEGRAM_BOT_TOKEN:

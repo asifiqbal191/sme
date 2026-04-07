@@ -1,8 +1,8 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, text, and_
+from sqlalchemy import select, func, text, and_, or_
 from datetime import datetime, timedelta
 import pytz
-from src.db.models import Order, PlatformEnum, Product, DHAKA_TZ
+from src.db.models import Order, PlatformEnum, Product, User, RoleEnum, DHAKA_TZ
 from typing import Optional
 
 def _now_local():
@@ -252,3 +252,109 @@ async def get_revenue_breakdown(session: AsyncSession, start_time: datetime, end
         {"product_name": row.product_name, "revenue": float(row.total_revenue or 0)}
         for row in rows
     ]
+
+async def search_orders(session: AsyncSession, query: str, limit: int = 10):
+    """Search all orders by product name, phone number, or order ID (admin use)."""
+    result = await session.execute(
+        select(Order).where(
+            or_(
+                Order.product_name.ilike(f"%{query}%"),
+                Order.phone_number.ilike(f"%{query}%"),
+                Order.order_id.ilike(f"%{query}%")
+            )
+        ).order_by(Order.timestamp.desc()).limit(limit)
+    )
+    return result.scalars().all()
+
+
+async def search_my_orders(session: AsyncSession, query: str, moderator_id: str, limit: int = 10):
+    """Search only the orders submitted by a specific moderator."""
+    result = await session.execute(
+        select(Order).where(
+            and_(
+                Order.created_by_id == moderator_id,
+                or_(
+                    Order.product_name.ilike(f"%{query}%"),
+                    Order.phone_number.ilike(f"%{query}%"),
+                    Order.order_id.ilike(f"%{query}%")
+                )
+            )
+        ).order_by(Order.timestamp.desc()).limit(limit)
+    )
+    return result.scalars().all()
+
+
+async def get_moderator_stats(session: AsyncSession, moderator_id: str):
+    """Returns today's sales stats for a single moderator."""
+    now = _now_local()
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    query = select(
+        func.sum(Order.price).label("total_sales"),
+        func.count(Order.id).label("total_orders")
+    ).where(
+        and_(
+            Order.timestamp >= start_of_day,
+            Order.created_by_id == moderator_id
+        )
+    )
+
+    result = await session.execute(query)
+    row = result.first()
+
+    return {
+        "total_sales": float(row.total_sales or 0),
+        "total_orders": int(row.total_orders or 0)
+    }
+
+
+async def get_all_moderators_stats(session: AsyncSession) -> list[dict]:
+    """Returns order stats (today / 7-day / all-time) for every active moderator."""
+    mods_result = await session.execute(
+        select(User).where(User.role == RoleEnum.MODERATOR, User.is_banned == False)
+    )
+    moderators = mods_result.scalars().all()
+    if not moderators:
+        return []
+
+    now = _now_local()
+    start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_week  = now - timedelta(days=7)
+
+    async def _fetch(mid: str, extra_condition):
+        r = await session.execute(
+            select(
+                func.count(Order.id).label("orders"),
+                func.sum(Order.price).label("sales")
+            ).where(Order.created_by_id == mid, extra_condition)
+        )
+        row = r.first()
+        return int(row.orders or 0), float(row.sales or 0)
+
+    stats = []
+    for mod in moderators:
+        mid = mod.telegram_id
+        today_orders,   today_sales   = await _fetch(mid, Order.timestamp >= start_of_today)
+        week_orders,    week_sales    = await _fetch(mid, Order.timestamp >= start_of_week)
+        alltime_orders, alltime_sales = await _fetch(mid, Order.id != None)  # noqa: E711
+
+        stats.append({
+            "name":           mod.full_name or "Unknown",
+            "id":             mid,
+            "platform":       mod.platform.value if mod.platform else "General",
+            "today_orders":   today_orders,
+            "today_sales":    today_sales,
+            "week_orders":    week_orders,
+            "week_sales":     week_sales,
+            "alltime_orders": alltime_orders,
+            "alltime_sales":  alltime_sales,
+        })
+
+    return stats
+
+
+async def get_all_products(session: AsyncSession) -> list:
+    """Returns all products ordered by name."""
+    result = await session.execute(select(Product).order_by(Product.name))
+    return result.scalars().all()
+

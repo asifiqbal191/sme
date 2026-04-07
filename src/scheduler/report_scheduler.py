@@ -9,16 +9,16 @@ Test Report:   Every 1 minute (for testing — disable after verification)
 """
 
 import logging
-import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from datetime import datetime, timezone
+from datetime import datetime
 from pytz import timezone as pytz_timezone
 
 from src.core.config import settings
 from src.db.session import async_session
 from src.services import analytics
+from src.services.notifier import send_admin_alert
 
 logger = logging.getLogger(__name__)
 
@@ -29,32 +29,33 @@ DHAKA_TZ = pytz_timezone("Asia/Dhaka")
 # ---------------------------------------------------------------------------
 
 async def _send_telegram_message(text: str):
-    """Send a message to the configured Telegram chat."""
+    """Send a message to all configured report chat IDs."""
     import httpx
 
-    chat_id = settings.TELEGRAM_CHAT_ID
+    chat_ids = settings.report_chat_ids
     token = settings.TELEGRAM_BOT_TOKEN
 
-    if not chat_id or not token:
-        logger.warning("TELEGRAM_CHAT_ID or TELEGRAM_BOT_TOKEN not set. Skipping report.")
+    if not chat_ids or not token:
+        logger.warning("No report chat IDs or TELEGRAM_BOT_TOKEN configured. Skipping report.")
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown",
-    }
 
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=payload, timeout=30)
-            if resp.status_code == 200:
-                logger.info(f"Report sent to Telegram successfully to chat_id: {chat_id}")
-            else:
-                logger.error(f"Failed to send report: {resp.status_code} — {resp.text}")
-    except Exception as e:
-        logger.error(f"Error sending telegram message: {e}")
+    async with httpx.AsyncClient() as client:
+        for chat_id in chat_ids:
+            payload = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "Markdown",
+            }
+            try:
+                resp = await client.post(url, json=payload, timeout=30)
+                if resp.status_code == 200:
+                    logger.info(f"Report sent to chat_id: {chat_id}")
+                else:
+                    logger.error(f"Failed to send to {chat_id}: {resp.status_code} — {resp.text}")
+            except Exception as e:
+                logger.error(f"Error sending to {chat_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +165,7 @@ async def _generate_daily_report():
 
     except Exception as e:
         logger.error(f"Error generating intelligent daily report: {e}", exc_info=True)
+        await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Daily Report\nError: `{str(e)[:200]}`")
 
 
 async def _generate_weekly_report():
@@ -194,6 +196,7 @@ async def _generate_weekly_report():
 
     except Exception as e:
         logger.error(f"Error generating weekly report: {e}", exc_info=True)
+        await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Weekly Report\nError: `{str(e)[:200]}`")
 
 
 async def _generate_monthly_report():
@@ -224,6 +227,7 @@ async def _generate_monthly_report():
 
     except Exception as e:
         logger.error(f"Error generating monthly report: {e}", exc_info=True)
+        await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Monthly Report\nError: `{str(e)[:200]}`")
 
 
 async def _check_sales_drop():
@@ -254,6 +258,7 @@ async def _check_sales_drop():
 
     except Exception as e:
         logger.error(f"Error checking sales drop: {e}", exc_info=True)
+        await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Sales Drop Alert\nError: `{str(e)[:200]}`")
 
 
 async def _trending_product_alert():
@@ -280,6 +285,7 @@ async def _trending_product_alert():
 
     except Exception as e:
         logger.error(f"Error generating trending product alert: {e}", exc_info=True)
+        await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Trending Product Alert\nError: `{str(e)[:200]}`")
 
 
 async def _generate_growth_report():
@@ -320,6 +326,7 @@ async def _generate_growth_report():
 
     except Exception as e:
         logger.error(f"Error generating growth report: {e}", exc_info=True)
+        await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Growth Report\nError: `{str(e)[:200]}`")
         
 async def _check_stock_prediction_alerts():
     """
@@ -354,6 +361,7 @@ async def _check_stock_prediction_alerts():
 
     except Exception as e:
         logger.error(f"Error checking stock prediction alerts: {e}", exc_info=True)
+        await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Stock Prediction Alert\nError: `{str(e)[:200]}`")
 
 
 # ---------------------------------------------------------------------------

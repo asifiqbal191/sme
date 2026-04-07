@@ -11,6 +11,7 @@ class ParsedOrder(BaseModel):
     price: float
     payment_status: Optional[str] = "PENDING"
     platform: Optional[PlatformEnum] = None
+    phone_number: Optional[str] = None
 
 def parse_order_message(message_text: str) -> Optional[ParsedOrder]:
     """
@@ -48,6 +49,7 @@ def parse_order_message(message_text: str) -> Optional[ParsedOrder]:
     qty_match = re.search(r'(?:Qty|Quantity):\s*(\d+)', message_text, re.IGNORECASE)
     price_match = re.search(r'Price:\s*([\d\.]+)', message_text, re.IGNORECASE)
     status_match = re.search(r'Status:\s*([A-Z]+)', message_text, re.IGNORECASE)
+    phone_match = re.search(r'Phone:\s*([\d\+\-\s]+)', message_text, re.IGNORECASE)
 
     if not (product_match and qty_match and price_match):
         return None
@@ -69,7 +71,8 @@ def parse_order_message(message_text: str) -> Optional[ParsedOrder]:
             quantity=quantity,
             price=price,
             payment_status=payment_status,
-            platform=detected_platform
+            platform=detected_platform,
+            phone_number=phone_match.group(1).strip() if phone_match else None
         )
     except (ValueError, ValidationError):
         return None

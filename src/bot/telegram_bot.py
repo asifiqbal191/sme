@@ -8,8 +8,13 @@ from src.bot.handlers import (
     chatid_command,
     today_command,
     orders_command,
+    search_command,
     top_command,
     pending_command,
+    markpaid_command,
+    setstock_command,
+    stock_command,
+    team_stats_command,
     check_sheets_command,
     button_handler,
     handle_message,
@@ -22,7 +27,9 @@ from src.bot.handlers import (
     weekly_command,
     monthly_command,
     growth_command,
-    alerts_command
+    alerts_command,
+    mod_stock_command,
+    lowstock_command
 )
 
 logger = logging.getLogger(__name__)
@@ -46,9 +53,16 @@ async def create_bot_application() -> Application:
     app.add_handler(CommandHandler("growth", growth_command))
     app.add_handler(CommandHandler("alerts", alerts_command))
     app.add_handler(CommandHandler("orders", orders_command))
+    app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("top", top_command))
     app.add_handler(CommandHandler("pending", pending_command))
     app.add_handler(CommandHandler("check_sheets", check_sheets_command))
+    app.add_handler(CommandHandler("setstock", setstock_command))
+    app.add_handler(CommandHandler("markpaid", markpaid_command))
+    app.add_handler(CommandHandler("stock", stock_command))
+    app.add_handler(CommandHandler("teamstats", team_stats_command))
+    app.add_handler(CommandHandler("mystock", mod_stock_command))
+    app.add_handler(CommandHandler("lowstock", lowstock_command))
     
     # Role Management Commands
     app.add_handler(CommandHandler("generate_invite", generate_invite_command))
