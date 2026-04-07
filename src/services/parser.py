@@ -55,7 +55,7 @@ def parse_order_message(message_text: str) -> Optional[ParsedOrder]:
         return None
         
     try:
-        product_name = product_match.group(1).strip()
+        product_name = product_match.group(1).strip().title()
         quantity = int(qty_match.group(1).strip())
         price = float(price_match.group(1).strip())
         

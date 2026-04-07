@@ -29,7 +29,8 @@ from src.bot.handlers import (
     growth_command,
     alerts_command,
     mod_stock_command,
-    lowstock_command
+    lowstock_command,
+    forcereport_command
 )
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ async def create_bot_application() -> Application:
     app.add_handler(CommandHandler("teamstats", team_stats_command))
     app.add_handler(CommandHandler("mystock", mod_stock_command))
     app.add_handler(CommandHandler("lowstock", lowstock_command))
+    app.add_handler(CommandHandler("forcereport", forcereport_command))
     
     # Role Management Commands
     app.add_handler(CommandHandler("generate_invite", generate_invite_command))

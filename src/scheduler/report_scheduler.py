@@ -385,19 +385,19 @@ def start_scheduler():
     # Use AsyncIOScheduler to run directly on the existing event loop
     scheduler = AsyncIOScheduler(timezone=DHAKA_TZ)
 
-    # ── Daily report: every day at 12:00 AM (Midnight) Asia/Dhaka ──
+    # ── Daily report: every day at 11:59 PM Asia/Dhaka (end of day) ──
     scheduler.add_job(
         _generate_daily_report,
-        trigger=CronTrigger(hour=0, minute=0, timezone=DHAKA_TZ),
+        trigger=CronTrigger(hour=23, minute=59, timezone=DHAKA_TZ),
         id="daily_report",
         name="Daily Sales Report",
         replace_existing=True,
     )
 
-    # ── Weekly report: every Friday at 12:00 AM (Midnight) Asia/Dhaka ──
+    # ── Weekly report: every Friday at 11:59 PM Asia/Dhaka ──
     scheduler.add_job(
         _generate_weekly_report,
-        trigger=CronTrigger(day_of_week="fri", hour=0, minute=0, timezone=DHAKA_TZ),
+        trigger=CronTrigger(day_of_week="fri", hour=23, minute=59, timezone=DHAKA_TZ),
         id="weekly_report",
         name="Weekly Sales Report",
         replace_existing=True,

@@ -320,27 +320,52 @@ async def _send_today_sales(update: Update, platform: PlatformEnum = None):
             
         await update.effective_message.reply_markdown(msg, reply_markup=get_main_menu_keyboard())
 
-async def _send_recent_orders(update: Update, platform: PlatformEnum = None, edit: bool = False):
+async def _send_recent_orders(update: Update, platform: PlatformEnum = None, edit: bool = False, offset: int = 0):
+    limit = 10
     async with async_session() as session:
-        orders = await analytics.get_recent_orders(session, limit=10, platform=platform)
-        
-        title = "📋 *Recent Orders*"
-        if platform == PlatformEnum.FACEBOOK:
-            title = "🟦 *Recent Facebook Orders*"
-        elif platform == PlatformEnum.WHATSAPP:
-            title = "🟢 *Recent WhatsApp Orders*"
-            
-        if not orders:
-            text = f"{title}\n\nNo orders found."
-        else:
-            text = f"{title}\n\n"
-            for o in orders:
-                text += f"ID: {o.order_id} - {o.product_name} (BDT {o.price})\nPlatform: {o.platform.value}\n---\n"
-        
-        if edit:
-            await update.effective_message.edit_text(text, parse_mode="Markdown", reply_markup=get_orders_filter_keyboard())
-        else:
-            await update.effective_message.reply_markdown(text, reply_markup=get_orders_filter_keyboard())
+        orders = await analytics.get_recent_orders(session, limit=limit + 1, platform=platform, offset=offset)
+
+    has_next = len(orders) > limit
+    if has_next:
+        orders = orders[:limit]
+
+    title = "📋 *Recent Orders*"
+    if platform == PlatformEnum.FACEBOOK:
+        title = "🟦 *Recent Facebook Orders*"
+    elif platform == PlatformEnum.WHATSAPP:
+        title = "🟢 *Recent WhatsApp Orders*"
+
+    plat_key = platform.value if platform else "all"
+
+    if not orders:
+        text = f"{title}\n\nNo orders found."
+    else:
+        text = f"{title} (#{offset + 1}–#{offset + len(orders)})\n\n"
+        for o in orders:
+            text += f"ID: {o.order_id} - {o.product_name} (BDT {o.price})\nPlatform: {o.platform.value}\n---\n"
+
+    # Build pagination nav row
+    nav_buttons = []
+    if offset > 0:
+        nav_buttons.append(InlineKeyboardButton("◀️ Prev", callback_data=f"cmd_orders_{plat_key}_{max(0, offset - limit)}"))
+    if has_next:
+        nav_buttons.append(InlineKeyboardButton("Next ▶️", callback_data=f"cmd_orders_{plat_key}_{offset + limit}"))
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🟦 Facebook Orders", callback_data="cmd_orders_FACEBOOK_0"),
+            InlineKeyboardButton("🟢 WhatsApp Orders", callback_data="cmd_orders_WHATSAPP_0")
+        ],
+    ]
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+    keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_main_menu")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if edit:
+        await update.effective_message.edit_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+    else:
+        await update.effective_message.reply_markdown(text, reply_markup=reply_markup)
 
 @require_admin
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -368,6 +393,15 @@ def _order_action_keyboard(order_id: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("✏️ Edit", callback_data=f"cmd_edit_{order_id}"),
             InlineKeyboardButton("❌ Cancel Order", callback_data=f"cmd_cancel_{order_id}")
+        ]
+    ])
+
+def _mod_order_action_keyboard(order_id: str) -> InlineKeyboardMarkup:
+    """Inline buttons for moderator: edit and mark as paid on their own orders."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Edit", callback_data=f"cmd_edit_{order_id}"),
+            InlineKeyboardButton("✅ Mark as Paid", callback_data=f"cmd_markpaid_{order_id}")
         ]
     ])
 
@@ -486,14 +520,10 @@ async def moderator_stats_command(update: Update, context: ContextTypes.DEFAULT_
             f"_{achievement}_"
         )
         
-        reply_markup = get_moderator_menu_keyboard()
-        # Ensure persistent keyboard stays active
-        await update.effective_message.reply_text("📌 Quick access menu active.", reply_markup=get_moderator_persistent_keyboard())
-        
         if update.callback_query:
-            await update.callback_query.edit_message_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
+            await update.callback_query.edit_message_text(msg, parse_mode="Markdown")
         else:
-            await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
+            await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
 
 @require_admin
@@ -604,7 +634,7 @@ async def setstock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.effective_message.reply_text("❌ Quantity must be a number. Example: `/setstock 50 Nike Air Max`", parse_mode="Markdown")
         return
 
-    product_name = " ".join(context.args[1:])
+    product_name = " ".join(context.args[1:]).title()
 
     async with async_session() as session:
         from sqlalchemy import select
@@ -746,6 +776,29 @@ async def _send_sheets_check(update: Update, edit: bool = False):
 async def check_sheets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_sheets_check(update, edit=False)
 
+@require_admin
+async def forcereport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: manually trigger daily/weekly/monthly report for testing.
+    Usage: /forcereport daily | /forcereport weekly | /forcereport monthly
+    """
+    from src.scheduler.report_scheduler import _generate_daily_report, _generate_weekly_report, _generate_monthly_report
+
+    args = context.args
+    report_type = args[0].lower() if args else "daily"
+
+    if report_type == "weekly":
+        await update.effective_message.reply_text("⏳ Sending weekly report now...")
+        await _generate_weekly_report()
+    elif report_type == "monthly":
+        await update.effective_message.reply_text("⏳ Sending monthly report now...")
+        await _generate_monthly_report()
+    else:
+        await update.effective_message.reply_text("⏳ Sending daily report now...")
+        await _generate_daily_report()
+
+    await update.effective_message.reply_text("✅ Report sent!", reply_markup=get_main_menu_keyboard())
+
+
 @require_moderator_or_admin
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -782,12 +835,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _send_today_sales(update, platform=PlatformEnum.FACEBOOK)
     elif query.data == "cmd_today_WHATSAPP":
         await _send_today_sales(update, platform=PlatformEnum.WHATSAPP)
-    elif query.data == "cmd_orders_all":
-        await _send_recent_orders(update, platform=None, edit=True)
-    elif query.data == "cmd_orders_FACEBOOK":
-        await _send_recent_orders(update, platform=PlatformEnum.FACEBOOK, edit=True)
-    elif query.data == "cmd_orders_WHATSAPP":
-        await _send_recent_orders(update, platform=PlatformEnum.WHATSAPP, edit=True)
+    elif query.data.startswith("cmd_orders_"):
+        # Handles both legacy (cmd_orders_all) and paginated (cmd_orders_all_10) formats
+        parts = query.data.split("_")
+        if len(parts) >= 4 and parts[-1].isdigit():
+            page_offset = int(parts[-1])
+            plat_key = "_".join(parts[2:-1])
+        else:
+            page_offset = 0
+            plat_key = "_".join(parts[2:])
+        if plat_key == "FACEBOOK":
+            plat = PlatformEnum.FACEBOOK
+        elif plat_key == "WHATSAPP":
+            plat = PlatformEnum.WHATSAPP
+        else:
+            plat = None
+        await _send_recent_orders(update, platform=plat, edit=True, offset=page_offset)
     elif query.data == "cmd_top":
         await top_command(update, context)
     elif query.data == "cmd_pending":
@@ -854,6 +917,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data == "cmd_my_stats":
         await moderator_stats_command(update, context)
 
+    # --- Admin: Update Stock from low stock alert button ---
+    elif query.data.startswith("cmd_admin_setstock_"):
+        if role != RoleEnum.ADMIN:
+            await query.answer("⛔ Only admins can update stock.", show_alert=True)
+            return
+        product_name = query.data.replace("cmd_admin_setstock_", "")
+        from src.db.models import Product as _Product
+        async with async_session() as session:
+            res = await session.execute(select(_Product).where(_Product.name == product_name))
+            prod = res.scalar_one_or_none()
+        current_stock = prod.current_stock if prod else "not tracked"
+        context.user_data["awaiting_setstock_product"] = product_name
+        await query.edit_message_text(
+            f"📦 *Update Stock for:* `{product_name}`\n"
+            f"📊 Current stock: *{current_stock}*\n\n"
+            f"Send the new stock quantity:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]])
+        )
+
     # --- Moderator: Check Stock ---
     elif query.data == "cmd_mod_stock":
         await mod_stock_command(update, context)
@@ -872,10 +955,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # --- Moderator: Report Low Stock prompt ---
     elif query.data == "cmd_mod_lowstock_prompt":
-        context.user_data["awaiting_mod_lowstock"] = True
+        context.user_data["awaiting_mod_lowstock_name"] = True
         await query.edit_message_text(
-            "⚠️ *Report Low Stock*\n\nType the product name and send it.\n"
-            "The admin will be notified immediately.",
+            "⚠️ *Report Low Stock — Step 1 of 2*\n\nType the *product name*:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]])
+        )
+
+    # --- Moderator: Low stock — confirmed suggested product ---
+    elif query.data.startswith("cmd_lowstock_pick_"):
+        product_name = query.data[len("cmd_lowstock_pick_"):]
+        from src.db.models import Product as _Product
+        async with async_session() as session:
+            res = await session.execute(select(_Product).where(_Product.name == product_name))
+            prod = res.scalar_one_or_none()
+        stock_info = f"📊 Current stock: *{prod.current_stock}*" if prod else "📊 _(not tracked)_"
+        context.user_data["awaiting_mod_lowstock_msg"] = product_name
+        await query.edit_message_text(
+            f"✅ Product: *{product_name}*\n{stock_info}\n\n"
+            f"⚠️ *Step 2 of 2* — Describe the issue\n_(e.g. 'Almost finished, need restock soon')_:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]])
+        )
+
+    # --- Moderator: Low stock — report unrecognised product anyway ---
+    elif query.data.startswith("cmd_lowstock_anyway_"):
+        product_name = query.data[len("cmd_lowstock_anyway_"):]
+        context.user_data["awaiting_mod_lowstock_msg"] = product_name
+        await query.edit_message_text(
+            f"⚠️ *Step 2 of 2* — Describe the issue for *{product_name}*\n_(e.g. 'Almost finished, need restock soon')_:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]])
         )
@@ -886,7 +994,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if role == RoleEnum.ADMIN:
             await query.edit_message_text("Welcome to the Multi-Platform Order Tracking Agent 🤖\n\nPlease select an option below:", reply_markup=get_main_menu_keyboard())
         else:
-            await query.edit_message_text("Welcome back! Use the button below to check your stats or just send an #ORDER.", reply_markup=get_moderator_menu_keyboard())
+            await query.edit_message_text("Welcome back! Use the keyboard below to check your stats or just send an #ORDER.")
 
     elif query.data == "cmd_admin_mgmt":
         if str(query.from_user.id) != str(settings.TELEGRAM_CHAT_ID):
@@ -1191,6 +1299,40 @@ async def mod_stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
 
+async def _send_lowstock_alert(product_name: str, reporter_name: str, description: str = "") -> None:
+    """Sends a low stock alert to all admins with current stock and an Update Stock button."""
+    from src.services.notifier import send_admin_alert
+    from src.db.models import Product
+
+    # Fetch current stock for this product
+    async with async_session() as session:
+        result = await session.execute(select(Product).where(Product.name == product_name))
+        product = result.scalar_one_or_none()
+
+    current_stock = product.current_stock if product else None
+    stock_line = f"📊 Current stock: *{current_stock}*" if current_stock is not None else "📊 Current stock: _not tracked_"
+
+    desc_line = f"💬 _{description}_\n" if description else ""
+
+    # Callback data limited to 64 bytes — use product name only (not description)
+    cb_product = product_name[:42]
+    markup = {
+        "inline_keyboard": [[
+            {"text": "📦 Update Stock", "callback_data": f"cmd_admin_setstock_{cb_product}"}
+        ]]
+    }
+
+    await send_admin_alert(
+        f"⚠️ *Low Stock Report*\n\n"
+        f"👤 *{reporter_name}* reported:\n"
+        f"📦 *{product_name}*\n"
+        f"{desc_line}"
+        f"{stock_line}\n\n"
+        f"Tap the button below to update stock.",
+        reply_markup=markup
+    )
+
+
 @require_moderator_or_admin
 async def lowstock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Moderator reports a low stock product to admin. Usage: /lowstock <product name>"""
@@ -1201,20 +1343,12 @@ async def lowstock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    product_name = " ".join(context.args).strip()
+    product_name = " ".join(context.args).strip().title()
     reporter_name = update.effective_user.full_name or "A moderator"
-
-    from src.services.notifier import send_admin_alert
-    await send_admin_alert(
-        f"⚠️ *Low Stock Report*\n\n"
-        f"*{reporter_name}* reported low stock for:\n"
-        f"📦 *{product_name}*\n\n"
-        f"Use `/setstock <qty> {product_name}` to update."
-    )
+    await _send_lowstock_alert(product_name, reporter_name)
     await update.effective_message.reply_text(
         f"✅ Admin has been notified about low stock for *{product_name}*.",
-        parse_mode="Markdown",
-        reply_markup=get_moderator_menu_keyboard()
+        parse_mode="Markdown"
     )
 
 
@@ -1234,10 +1368,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 reply_markup=get_main_menu_keyboard()
             )
         else:
-            await update.effective_message.reply_text("📌 Quick access menu updated.", reply_markup=get_moderator_persistent_keyboard())
             await update.effective_message.reply_text(
-                "Welcome back! Send an #ORDER or use the button below to check your stats.",
-                reply_markup=get_moderator_menu_keyboard()
+                "Welcome back! Use the keyboard below or send an #ORDER.",
+                reply_markup=get_moderator_persistent_keyboard()
             )
         return
 
@@ -1265,10 +1398,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Handle persistent keyboard "Report Low Stock" button tap (Moderator)
     if text and text.strip() == "⚠️ Report Low Stock":
-        context.user_data["awaiting_mod_lowstock"] = True
+        context.user_data["awaiting_mod_lowstock_name"] = True
         await update.effective_message.reply_text(
-            "⚠️ *Report Low Stock*\n\nType the product name and send it.\n"
-            "The admin will be notified immediately.",
+            "⚠️ *Report Low Stock — Step 1 of 2*\n\nType the *exact product name*:",
             parse_mode="Markdown"
         )
         return
@@ -1303,7 +1435,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     return
                 try:
                     if field == "product":
-                        order.product_name = new_val
+                        order.product_name = new_val.title()
                     elif field == "qty":
                         order.quantity = int(new_val)
                     elif field == "price":
@@ -1357,6 +1489,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     )
                 return
 
+            # --- Handle awaiting stock quantity from low stock alert button ---
+            if context.user_data.get("awaiting_setstock_product"):
+                product_name = context.user_data.pop("awaiting_setstock_product")
+                try:
+                    quantity = int(text.strip())
+                except ValueError:
+                    await update.effective_message.reply_text("❌ Please send a valid number.", parse_mode="Markdown")
+                    context.user_data["awaiting_setstock_product"] = product_name  # restore state
+                    return
+                from src.db.models import Product
+                async with async_session() as session:
+                    result = await session.execute(select(Product).where(Product.name == product_name))
+                    product = result.scalar_one_or_none()
+                    if product:
+                        product.current_stock = quantity
+                    else:
+                        session.add(Product(name=product_name, current_stock=quantity))
+                    await session.commit()
+                await update.effective_message.reply_text(
+                    f"✅ *Stock Updated!*\n\n📦 *{product_name}*: {quantity} units",
+                    parse_mode="Markdown",
+                    reply_markup=get_main_menu_keyboard()
+                )
+                return
+
             # Check if we are waiting for a spreadsheet name
             if context.user_data.get("awaiting_sheet_name"):
                 sheet_name = text.strip()
@@ -1392,7 +1549,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 if not orders:
                     await update.effective_message.reply_text(
                         f"🔍 No orders found for *\"{query_str}\"*.",
-                        parse_mode="Markdown", reply_markup=get_moderator_menu_keyboard()
+                        parse_mode="Markdown"
                     )
                     return
                 await update.effective_message.reply_text(
@@ -1400,25 +1557,75 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 for order in orders:
                     await update.effective_message.reply_text(
-                        _order_card_text(order), parse_mode="Markdown"
+                        _order_card_text(order), parse_mode="Markdown",
+                        reply_markup=_mod_order_action_keyboard(order.order_id)
                     )
                 return
 
-            # --- Moderator: awaiting low stock product name ---
-            if context.user_data.get("awaiting_mod_lowstock"):
-                context.user_data["awaiting_mod_lowstock"] = False
-                product_name = text.strip()
+            # --- Moderator: low stock step 1 — product name ---
+            if context.user_data.get("awaiting_mod_lowstock_name"):
+                context.user_data["awaiting_mod_lowstock_name"] = False
+                typed_name = text.strip().title()
+
+                # Validate against known products
+                import difflib
+                async with async_session() as session:
+                    all_products = await analytics.get_all_products(session)
+                product_names = [p.name for p in all_products]
+
+                # Exact match (case-insensitive)
+                exact_match = next((n for n in product_names if n.lower() == typed_name.lower()), None)
+
+                if exact_match:
+                    prod = next((p for p in all_products if p.name == exact_match), None)
+                    stock_info = f"📊 Current stock: *{prod.current_stock}*" if prod else "📊 _(not tracked)_"
+                    context.user_data["awaiting_mod_lowstock_msg"] = exact_match
+                    await update.effective_message.reply_text(
+                        f"✅ Product: *{exact_match}*\n{stock_info}\n\n"
+                        f"⚠️ *Step 2 of 2* — Describe the issue\n_(e.g. 'Almost finished, need restock soon')_:",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    # Try fuzzy matching
+                    close_matches = difflib.get_close_matches(typed_name, product_names, n=3, cutoff=0.5)
+                    if close_matches:
+                        buttons = [
+                            [InlineKeyboardButton(f"✅ {name}", callback_data=f"cmd_lowstock_pick_{name[:42]}")]
+                            for name in close_matches
+                        ]
+                        buttons.append([InlineKeyboardButton(f"📋 Report \"{typed_name[:30]}\" anyway", callback_data=f"cmd_lowstock_anyway_{typed_name[:42]}")])
+                        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")])
+                        await update.effective_message.reply_text(
+                            f"⚠️ *Product Not Found*\n\n"
+                            f"No product named *\"{typed_name}\"* found.\n\n"
+                            f"Did you mean one of these?",
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup(buttons)
+                        )
+                    else:
+                        # No close matches — allow report anyway
+                        buttons = [
+                            [InlineKeyboardButton(f"📋 Report \"{typed_name[:30]}\" anyway", callback_data=f"cmd_lowstock_anyway_{typed_name[:42]}")],
+                            [InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]
+                        ]
+                        await update.effective_message.reply_text(
+                            f"⚠️ *Product Not Found*\n\n"
+                            f"*\"{typed_name}\"* is not in our product records.\n\n"
+                            f"You can still report it, or cancel and verify the name in 📦 Check Stock.",
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup(buttons)
+                        )
+                return
+
+            # --- Moderator: low stock step 2 — description ---
+            if context.user_data.get("awaiting_mod_lowstock_msg"):
+                product_name = context.user_data.pop("awaiting_mod_lowstock_msg")
+                description = text.strip()
                 reporter_name = update.effective_user.full_name or "A moderator"
-                from src.services.notifier import send_admin_alert
-                await send_admin_alert(
-                    f"⚠️ *Low Stock Report*\n\n"
-                    f"*{reporter_name}* reported low stock for:\n"
-                    f"📦 *{product_name}*\n\n"
-                    f"Use `/setstock <qty> {product_name}` to update."
-                )
+                await _send_lowstock_alert(product_name, reporter_name, description)
                 await update.effective_message.reply_text(
                     f"✅ Admin notified about low stock for *{product_name}*.",
-                    parse_mode="Markdown", reply_markup=get_moderator_menu_keyboard()
+                    parse_mode="Markdown"
                 )
                 return
 

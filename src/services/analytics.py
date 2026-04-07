@@ -159,16 +159,16 @@ async def get_monthly_top_product(session: AsyncSession):
     return None
 
 
-async def get_recent_orders(session: AsyncSession, limit: int = 10, platform: Optional[PlatformEnum] = None):
+async def get_recent_orders(session: AsyncSession, limit: int = 10, platform: Optional[PlatformEnum] = None, offset: int = 0):
     conditions = []
     if platform:
         conditions.append(Order.platform == platform)
-        
+
     query = select(Order)
     if conditions:
         query = query.where(and_(*conditions))
-        
-    query = query.order_by(Order.timestamp.desc()).limit(limit)
+
+    query = query.order_by(Order.timestamp.desc()).offset(offset).limit(limit)
     result = await session.execute(query)
     return result.scalars().all()
 
