@@ -1,7 +1,10 @@
 import logging
 from telegram import BotCommand
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, TypeHandler, ContextTypes
+from telegram import Update
 from src.core.config import settings
+from src.core.context import set_tenant_id
+from src.bot.bot_manager import bot_manager
 
 from src.bot.handlers import (
     start_command,
@@ -30,20 +33,38 @@ from src.bot.handlers import (
     alerts_command,
     mod_stock_command,
     lowstock_command,
-    forcereport_command
+    forcereport_command,
+    new_client_command,
+    list_clients_command
 )
 
 logger = logging.getLogger(__name__)
+
+async def set_tenant_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Middleware to set tenant ID for the current request based on the Bot Token."""
+    if context.bot and context.bot.token:
+        tenant_id = bot_manager.get_tenant_id_from_token(context.bot.token)
+        if tenant_id:
+            set_tenant_id(tenant_id)
 
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands([
         BotCommand("start", "Open Main Menu"),
         BotCommand("chatid", "Get Telegram Chat ID"),
+        BotCommand("newclient", "Create a new client tenant"),
+        BotCommand("listclients", "List all client tenants"),
     ])
     logger.info("Native telegram menu setup complete.")
 
-async def create_bot_application() -> Application:
-    app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+async def create_bot_application(token: str) -> Application:
+    app = Application.builder().token(token).post_init(post_init).build()
+    
+    # Middleware to set Tenant ID
+    app.add_handler(TypeHandler(Update, set_tenant_context), group=-1)
+
+    # Superadmin Commands
+    app.add_handler(CommandHandler("newclient", new_client_command))
+    app.add_handler(CommandHandler("listclients", list_clients_command))
     
     # Core/Admin Commands
     app.add_handler(CommandHandler("start", start_command))

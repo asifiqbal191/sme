@@ -22,6 +22,8 @@ service_account.json
 # IDEs
 .vscode/
 .idea/
+backups/
+.claude/
 
 # Logs
 *.log

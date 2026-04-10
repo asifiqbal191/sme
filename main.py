@@ -5,9 +5,12 @@ from sqlalchemy import text
 from src.core.config import settings
 from src.db.session import engine
 from src.db.models import Base
-from src.bot.telegram_bot import create_bot_application
+from src.bot.bot_manager import bot_manager
 from src.scheduler.report_scheduler import start_scheduler, stop_scheduler, _capture_event_loop
 import asyncio
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from src.api.dashboard import router as dashboard_router
 
 # Setup logging
 logging.basicConfig(
@@ -16,12 +19,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-bot_app = None
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global bot_app
-    
     # Initialize DB
     logger.info("Initializing database schema...")
     async with engine.begin() as conn:
@@ -39,19 +40,13 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass  # Column already exists, safe to ignore
         
-    logger.info("Starting up Telegram Bot...")
-    if settings.TELEGRAM_BOT_TOKEN:
-        bot_app = await create_bot_application()
-        await bot_app.initialize()
-        await bot_app.start()
-        await bot_app.updater.start_polling(drop_pending_updates=True)
-    else:
-        logger.warning("No TELEGRAM_BOT_TOKEN provided. Bot is disabled.")
+    logger.info("Starting up Telegram Bots for all tenants...")
+    await bot_manager.start_all_tenant_bots()
 
     # Start the automated report scheduler
     try:
         _capture_event_loop()  # Capture the running asyncio loop for the scheduler
-        start_scheduler()
+        await start_scheduler()
         logger.info("Report scheduler initialized.")
     except Exception as e:
         logger.error(f"Failed to start report scheduler: {e}", exc_info=True)
@@ -64,24 +59,29 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Error stopping scheduler: {e}", exc_info=True)
 
-    logger.info("Shutting down Telegram Bot...")
-    if bot_app:
-        await bot_app.updater.stop()
-        await bot_app.stop()
-        await bot_app.shutdown()
+    logger.info("Shutting down Telegram Bots...")
+    await bot_manager.stop_all_bots()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
     lifespan=lifespan
 )
 
+app.include_router(dashboard_router)
+app.mount("/static", StaticFiles(directory="src/static"), name="static")
+
 @app.get("/")
 async def root():
     return {
         "message": "Welcome to the Multi-Platform Order Tracking Agent API",
         "docs": "Visit /docs for API documentation",
-        "health": "Visit /health for system status"
+        "health": "Visit /health for system status",
+        "dashboard": "Visit /dashboard to view the order analytics dashboard"
     }
+
+@app.get("/dashboard")
+async def serve_dashboard():
+    return FileResponse("src/static/index.html")
 
 @app.get("/health")
 async def health_check():

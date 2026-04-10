@@ -3,17 +3,23 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKe
 from telegram.ext import ContextTypes
 
 from src.core.config import settings
+from src.core.context import get_tenant_id
 from src.db.session import async_session
 from src.services import analytics, sheets
 from src.services.parser import parse_order_message
 from src.services.order_service import process_telegram_order
+from src.services import tenant_service
 from sqlalchemy import select
 from src.db.models import PlatformEnum, Order, Payment, PaymentStatusEnum
 from src.services import config_service
+from src.services.config_service import SCHEDULE_JOBS
 from src.services.sheets import check_google_sheets_connection
+from src.bot.bot_manager import bot_manager
 
 from src.auth.roles import (
+    ADMIN_ROLES,
     require_admin,
+    require_superadmin,
     require_moderator_or_admin,
     generate_invite_code,
     generate_admin_invite_code,
@@ -22,12 +28,85 @@ from src.auth.roles import (
     set_ban_status,
     get_all_moderators,
     get_user_role,
-    get_secondary_admin,
-    remove_secondary_admin,
+    get_tenant_admin,
+    remove_tenant_admin,
     RoleEnum
 )
 
 logger = logging.getLogger(__name__)
+
+def _build_invite_link(bot_username: str | None, code: str) -> str | None:
+    if not bot_username:
+        return None
+    return f"https://t.me/{bot_username}?start=join-{code}"
+
+def _extract_join_code_from_start(args: list[str]) -> str | None:
+    if not args:
+        return None
+    payload = args[0].strip()
+    lowered = payload.lower()
+    if lowered.startswith("join-") or lowered.startswith("join_"):
+        return payload[5:]
+    return None
+
+async def _send_admin_home(update: Update, role: RoleEnum) -> None:
+    if role == RoleEnum.SUPERADMIN:
+        from telegram import ReplyKeyboardRemove
+        await update.effective_message.reply_text("📌 Superadmin Mode Active.", reply_markup=ReplyKeyboardRemove())
+        text = "Welcome back, Owner!\n\nThis is the Superadmin control panel. You can manage your clients, active bots, and platform configuration here."
+        await update.effective_message.reply_text(
+            text,
+            reply_markup=get_superadmin_menu_keyboard(),
+            parse_mode="Markdown",
+        )
+    else:
+        await update.effective_message.reply_text("📌 Quick access pinned below.", reply_markup=get_persistent_keyboard())
+        text = "Welcome to the Multi-Platform Order Tracking Agent 🤖\n\nPlease select an option below:"
+        await update.effective_message.reply_text(
+            text,
+            reply_markup=get_main_menu_keyboard(),
+            parse_mode="Markdown",
+        )
+
+async def _complete_invite_join(update: Update, code: str) -> None:
+    user_id = str(update.effective_user.id)
+    full_name = update.effective_user.full_name or "Moderator"
+    result = await redeem_invite_code(user_id, full_name, code)
+
+    if result == RoleEnum.ADMIN:
+        welcome_msg = (
+            f"✅ **Welcome {full_name}!** You have been added as an Admin.\n\n"
+            "You now have full access to this client's workspace.\n\n"
+            "**What you can do:**\n"
+            "• View daily, weekly and monthly sales reports\n"
+            "• Monitor top products and revenue breakdown\n"
+            "• Check pending orders and stock alerts\n"
+            "• Manage moderators (invite, ban, unban)\n"
+            "• Connect and manage Google Sheets\n\n"
+            "Tap the button below to open your dashboard."
+        )
+        await update.effective_message.reply_text("📌 Quick access pinned below.", reply_markup=get_persistent_keyboard())
+        menu_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Open Dashboard", callback_data="cmd_main_menu")]])
+        await update.effective_message.reply_text(welcome_msg, parse_mode="Markdown", reply_markup=menu_keyboard)
+        return
+
+    if result == RoleEnum.MODERATOR:
+        welcome_msg = (
+            f"✅ **Welcome {full_name}!** You have successfully joined as a Moderator.\n\n"
+            "Here is how to use the bot:\n"
+            "Whenever you receive a new order, simply send a message in this exact format:\n\n"
+            "`#ORDER`\n"
+            "`Product: Exact Product Name`\n"
+            "`Qty: 1`\n"
+            "`Price: 500`\n"
+            "`Phone: 017XXXXXXXX`\n\n"
+            "I will save it and automatically update the Google Sheets database!"
+        )
+        await update.effective_message.reply_text("📌 Quick access pinned below.", reply_markup=get_moderator_persistent_keyboard())
+        await update.effective_message.reply_text(welcome_msg, parse_mode="Markdown")
+        return
+
+    await update.effective_message.reply_text(f"❌ Failed to join: {result}")
 
 def get_persistent_keyboard():
     """Persistent reply keyboard pinned at the bottom of the chat for Admin."""
@@ -47,11 +126,20 @@ def get_moderator_persistent_keyboard():
     )
 
 
+def get_superadmin_menu_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📋 List All Clients", callback_data="cmd_sa_list_clients")],
+        [InlineKeyboardButton("➕ Add New Client", callback_data="cmd_sa_add_client")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 
 def get_main_menu_keyboard():
     keyboard = [
-        [InlineKeyboardButton("📊 Today's Sales", callback_data="cmd_today_all")],
+        [
+            InlineKeyboardButton("📊 Today's Sales", callback_data="cmd_today_all"),
+            InlineKeyboardButton("🌍 Web Dashboard", url=settings.DASHBOARD_URL)
+        ],
         [
             InlineKeyboardButton("📅 Weekly", callback_data="cmd_weekly"),
             InlineKeyboardButton("📅 Monthly", callback_data="cmd_monthly")
@@ -90,6 +178,7 @@ def get_moderator_menu_keyboard():
 
 def get_settings_keyboard():
     keyboard = [
+        [InlineKeyboardButton("⏰ Schedule & Alerts", callback_data="cmd_schedule_menu")],
         [InlineKeyboardButton("🎟️ Generate Invite Link", callback_data="cmd_generate_invite")],
         [InlineKeyboardButton("👥 List Moderators", callback_data="cmd_list_mods")],
         [InlineKeyboardButton("👑 Admin Management", callback_data="cmd_admin_mgmt")],
@@ -97,6 +186,120 @@ def get_settings_keyboard():
         [InlineKeyboardButton("🏠 Back to Main Menu", callback_data="cmd_main_menu")]
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+# ---------------------------------------------------------------------------
+# Schedule Settings UI helpers
+# ---------------------------------------------------------------------------
+
+async def _build_schedule_overview() -> tuple[str, InlineKeyboardMarkup]:
+    """Return the schedule overview text and its navigation keyboard."""
+    lines = [
+        "⏰ *Schedule & Alert Settings*",
+        "",
+        "📍 All times use *Asia/Dhaka* timezone _(GMT+6)_",
+        "Tap any item below to configure its time or toggle it on/off",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        "*📋 Reports* — Always Active",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for job_id in ["daily_report", "weekly_report", "monthly_report"]:
+        cfg = SCHEDULE_JOBS[job_id]
+        t = await config_service.get_job_time(job_id)
+        lines.append(f"  ✅ {cfg['name']}  →  `{t}`  _({cfg['recurrence']})_")
+
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        "*🔔 Alerts* — Can be enabled or disabled",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+    ])
+    for job_id in ["sales_drop_alert", "trending_product_alert",
+                   "growth_comparison_report", "stock_prediction_alert"]:
+        cfg = SCHEDULE_JOBS[job_id]
+        t = await config_service.get_job_time(job_id)
+        enabled = await config_service.get_job_enabled(job_id)
+        dot = "🟢" if enabled else "🔴"
+        lines.append(f"  {dot} {cfg['name']}  →  `{t}`")
+
+    text = "\n".join(lines)
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+    # Report buttons — show current time
+    for job_id in ["daily_report", "weekly_report", "monthly_report"]:
+        cfg = SCHEDULE_JOBS[job_id]
+        t = await config_service.get_job_time(job_id)
+        keyboard.append([InlineKeyboardButton(
+            f"{cfg['name']} — {t}",
+            callback_data=f"cmd_sched_job_{job_id}"
+        )])
+    # Alert buttons — show time + on/off dot
+    for job_id in ["sales_drop_alert", "trending_product_alert",
+                   "growth_comparison_report", "stock_prediction_alert"]:
+        cfg = SCHEDULE_JOBS[job_id]
+        t = await config_service.get_job_time(job_id)
+        enabled = await config_service.get_job_enabled(job_id)
+        dot = "🟢" if enabled else "🔴"
+        keyboard.append([InlineKeyboardButton(
+            f"{dot} {cfg['name']} — {t}",
+            callback_data=f"cmd_sched_job_{job_id}"
+        )])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Settings", callback_data="cmd_settings")])
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+async def _build_job_detail(job_id: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Return the detail card text and action keyboard for a single job."""
+    cfg = SCHEDULE_JOBS[job_id]
+    t = await config_service.get_job_time(job_id)
+    enabled_key = cfg.get("enabled_key")
+
+    lines = [
+        f"*{cfg['name']}*",
+        f"_{cfg['description']}_",
+        "",
+        f"📅 *Recurrence:*  {cfg['recurrence']}",
+        f"⏰ *Current Time:*  `{t}`  _(Asia/Dhaka, GMT+6)_",
+    ]
+
+    if enabled_key:
+        enabled = await config_service.get_job_enabled(job_id)
+        status = "🟢 *Enabled*" if enabled else "🔴 *Disabled*"
+        lines.append(f"🔔 *Status:*  {status}")
+    else:
+        lines.append("🔔 *Status:*  ✅ Always Active _(cannot be disabled)_")
+
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        "*How to change the time:*",
+        "1\\. Tap *Change Time* below",
+        "2\\. Send the new time in `HH:MM` 24-hour format",
+        "",
+        "*Examples:*",
+        "  `09:00`  →  9:00 AM",
+        "  `14:30`  →  2:30 PM",
+        "  `21:00`  →  9:00 PM",
+        "  `23:59`  →  11:59 PM",
+    ])
+    text = "\n".join(lines)
+
+    keyboard: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("⏰ Change Time", callback_data=f"cmd_sched_settime_{job_id}")],
+    ]
+    if enabled_key:
+        enabled = await config_service.get_job_enabled(job_id)
+        if enabled:
+            keyboard.append([InlineKeyboardButton(
+                "🔴 Disable This Alert", callback_data=f"cmd_sched_toggle_{job_id}"
+            )])
+        else:
+            keyboard.append([InlineKeyboardButton(
+                "🟢 Enable This Alert", callback_data=f"cmd_sched_toggle_{job_id}"
+            )])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Schedule", callback_data="cmd_schedule_menu")])
+    return text, InlineKeyboardMarkup(keyboard)
 
 def get_orders_filter_keyboard():
     keyboard = [
@@ -118,8 +321,32 @@ def get_invite_platform_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-@require_admin
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    join_code = _extract_join_code_from_start(context.args)
+    if join_code:
+        await _complete_invite_join(update, join_code)
+        return
+
+    user_id = str(update.effective_user.id)
+    role = await get_user_role(user_id)
+    if role in ADMIN_ROLES:
+        await _send_admin_home(update, role)
+        return
+
+    if role == RoleEnum.MODERATOR:
+        await update.effective_message.reply_text("ðŸ“Œ Quick access pinned below.", reply_markup=get_moderator_persistent_keyboard())
+        await update.effective_message.reply_text(
+            "Welcome back! Use the keyboard below to check your stats or send a new `#ORDER` anytime.",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Welcome. You need an invite from the owner or client admin before you can access this bot.\n\n"
+        "If you already have a code, send `/join YOUR-CODE`.",
+        parse_mode="Markdown",
+    )
+    return
     # Pin the persistent keyboard at the bottom
     await update.effective_message.reply_text("📌 Quick access pinned below.", reply_markup=get_persistent_keyboard())
     # Show the inline dashboard
@@ -146,17 +373,26 @@ async def generate_invite_command(update: Update, context: ContextTypes.DEFAULT_
     else:
         await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=get_invite_platform_keyboard())
 
-async def _do_generate_invite(update: Update, platform: PlatformEnum):
+async def _do_generate_invite(update: Update, context: ContextTypes.DEFAULT_TYPE, platform: PlatformEnum):
     code = await generate_invite_code(platform)
+    bot_username = getattr(context.bot, "username", None)
+    invite_link = _build_invite_link(bot_username, code)
     plat_icon = "🟦 Facebook" if platform == PlatformEnum.FACEBOOK else "🟢 WhatsApp"
     
     admin_msg = f"🎟️ **New {plat_icon} Invite Generated!**\n\nForward or copy the message below to your new moderator:"
     
+    bot_display = bot_username.replace("_", r"\_") if bot_username else "bot"
+    step_one = f"**Step 1:** To connect your account, open the bot here ðŸ‘‰ @{bot_display} and send this exact code:\n`/join {code}`"
+    if invite_link:
+        step_one = (
+            f"**Step 1:** Click this access link:\n{invite_link.replace('_', r'\_')}\n\n"
+            f"Or open @{bot_display} and send:\n`/join {code}`"
+        )
+
     forward_msg = (
         f"👋 **Welcome to the team!**\n"
         f"You have been invited to access the Order Tracking Bot as a {plat_icon} Moderator.\n\n"
-        f"**Step 1:** To connect your account, open the bot here 👉 @SME\_management\_bot and send this exact code:\n"
-        f"`/join {code}`\n\n"
+        f"{step_one}\n\n"
         f"**Step 2:** After joining, whenever you receive a new order, simply copy-paste and fill out this format here:\n\n"
         f"`#ORDER`\n"
         f"`Product: (Write Name Here)`\n"
@@ -176,11 +412,18 @@ async def _do_generate_invite(update: Update, platform: PlatformEnum):
         await update.effective_message.reply_text(admin_msg, parse_mode="Markdown", reply_markup=get_settings_keyboard())
         await update.effective_message.reply_text(forward_msg, parse_mode="Markdown", reply_markup=menu_keyboard)
 
+    if invite_link:
+        target_message = update.callback_query.message if update.callback_query else update.effective_message
+        await target_message.reply_text(f"Direct join link:\n{invite_link}")
+
 async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.effective_message.reply_text("❌ Please provide an invite code. Example: `/join INV-ABCD123`")
         return
         
+    await _complete_invite_join(update, context.args[0])
+    return
+
     code = context.args[0]
     user_id = str(update.effective_user.id)
     full_name = update.effective_user.full_name or "Moderator"
@@ -221,6 +464,87 @@ async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     else:
         await update.effective_message.reply_text(f"❌ Failed to join: {result}")
+
+@require_superadmin
+async def new_client_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    raw = " ".join(context.args).strip()
+    if not raw:
+        await update.effective_message.reply_text(
+            "Usage:\n<code>/newclient Lux | 123456:ABCDEF | optional-sheet-id-or-name</code>\n\n"
+            "The sheet part is optional.",
+            parse_mode="HTML",
+        )
+        return
+
+    parts = [part.strip() for part in raw.split("|")]
+    if len(parts) < 2:
+        await update.effective_message.reply_text(
+            "Please provide at least the client name and bot token.\n\n"
+            "Example:\n<code>/newclient Lux | 123456:ABCDEF | Lux Orders</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    client_name = parts[0]
+    bot_token = parts[1]
+    google_sheet_name = parts[2] if len(parts) > 2 else None
+
+    try:
+        tenant = await tenant_service.create_tenant(client_name, bot_token, google_sheet_name)
+    except ValueError as exc:
+        await update.effective_message.reply_text(f"❌ {exc}")
+        return
+
+    admin_code = await generate_admin_invite_code(str(tenant.id))
+    app = await bot_manager.start_tenant_bot(tenant)
+    bot_username = bot_manager.get_bot_username(str(tenant.id))
+    invite_link = _build_invite_link(bot_username, admin_code) if admin_code else None
+
+    status_line = "✅ Bot started successfully." if app else "⚠️ Client saved, but the bot could not be started. Please verify the token."
+    bot_line = f"@{bot_username}" if bot_username else "<i>Username unavailable until the bot starts successfully</i>"
+
+    lines = [
+        f"✅ <b>Client Created:</b> {tenant.name}",
+        f"Client ID: <code>{tenant.id}</code>",
+        f"Bot: {bot_line}",
+        status_line,
+    ]
+    if tenant.google_sheet_name:
+        lines.append(f"Sheet: <code>{tenant.google_sheet_name}</code>")
+    if admin_code:
+        lines.append("")
+        lines.append("<b>Client Admin Access</b>")
+        if invite_link:
+            lines.append(invite_link)
+        lines.append(f"Fallback code: <code>/join {admin_code}</code>")
+    else:
+        lines.append("")
+        lines.append("⚠️ This client already has an admin, so no new admin invite was created.")
+
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+@require_superadmin
+async def list_clients_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clients = await tenant_service.list_tenants()
+    if not clients:
+        await update.effective_message.reply_text("No clients found yet. Use `/newclient` to create the first one.", parse_mode="Markdown")
+        return
+
+    lines = ["📋 *Client List*"]
+    for index, client in enumerate(clients, start=1):
+        status = "Active" if client["is_active"] else "Inactive"
+        sheet_name = client["google_sheet_name"] or "Not set"
+        lines.append(
+            f"\n{index}. *{client['name']}*\n"
+            f"ID: `{client['id']}`\n"
+            f"Status: {status}\n"
+            f"Admins: {client['admin_count']} | Moderators: {client['moderator_count']}\n"
+            f"Sheet: `{sheet_name}`"
+        )
+
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 
 @require_admin
 async def add_mod_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -817,6 +1141,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "cmd_gen_invite_", "cmd_list_mods", "cmd_manage_bans",
         "cmd_prompt_", "cmd_admin_mgmt", "cmd_gen_admin_invite",
         "cmd_remove_admin_", "cmd_manage_sheets",
+        "cmd_sched", "cmd_sa_",
     ]
     
     is_admin_cmd = False
@@ -825,9 +1150,63 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             is_admin_cmd = True
             break
             
-    if is_admin_cmd and role != RoleEnum.ADMIN:
+    if is_admin_cmd and role not in ADMIN_ROLES:
         await query.answer("⛔ Access Denied. Admin privileges required.", show_alert=True)
         return
+
+    if query.data == "cmd_sa_list_clients":
+        await list_clients_command(update, context)
+    elif query.data == "cmd_sa_add_client":
+        context.user_data["awaiting_sa_client_name"] = True
+        msg = (
+            "➕ *Add a New Client*\n\n"
+            "This wizard will guide you through creating a new client.\n\n"
+            "*Step 1 of 3:*\n"
+            "Please send the *Name* of the new client (e.g. `Lux Corporation`):"
+        )
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]])
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
+    elif query.data == "cmd_sa_confirm_client":
+        client_name = context.user_data.get("sa_new_client_name")
+        bot_token = context.user_data.get("sa_new_client_token")
+        sheet_name = context.user_data.get("sa_new_client_sheet")
+        
+        if not client_name or not bot_token:
+            await query.answer("Missing data. Please try adding again.", show_alert=True)
+            return
+            
+        await query.edit_message_text("⏳ Creating workspace and starting bot. Please wait...", parse_mode="Markdown")
+        
+        try:
+            tenant = await tenant_service.create_tenant(client_name, bot_token, sheet_name)
+        except ValueError as exc:
+            await query.edit_message_text(f"❌ {exc}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="cmd_main_menu")]]))
+            return
+
+        admin_code = await generate_admin_invite_code(str(tenant.id))
+        app = await bot_manager.start_tenant_bot(tenant)
+        bot_username = bot_manager.get_bot_username(str(tenant.id))
+        invite_link = _build_invite_link(bot_username, admin_code) if admin_code else None
+
+        status_line = "✅ Bot started successfully." if app else "⚠️ Client saved, but the bot could not be started. Please verify the token."
+        bot_line = f"@{bot_username}" if bot_username else "_Username unavailable until the bot starts successfully_"
+
+        lines = [
+            f"✅ *Client Created:* {tenant.name}",
+            f"Client ID: `{tenant.id}`",
+            f"Bot: {bot_line}",
+            status_line,
+        ]
+        if tenant.google_sheet_name:
+            lines.append(f"Sheet: `{tenant.google_sheet_name}`")
+        if admin_code:
+            lines.append("")
+            lines.append("*Client Admin Access*")
+            if invite_link:
+                lines.append(invite_link)
+            lines.append(f"Fallback code: `/join {admin_code}`")
+            
+        await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="cmd_main_menu")]]))
 
     if query.data == "cmd_today_all":
         await _send_today_sales(update, platform=None)
@@ -871,12 +1250,75 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _send_sheets_check(update, edit=True)
     elif query.data == "cmd_settings":
         await query.edit_message_text("⚙️ **Settings & Management**\n\nChoose an option:", parse_mode="Markdown", reply_markup=get_settings_keyboard())
+
+    # ── Schedule & Alert Settings ──────────────────────────────────────────
+    elif query.data == "cmd_schedule_menu":
+        text, keyboard = await _build_schedule_overview()
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif query.data.startswith("cmd_sched_job_"):
+        job_id = query.data[len("cmd_sched_job_"):]
+        if job_id not in SCHEDULE_JOBS:
+            await query.answer("Unknown job.", show_alert=True)
+            return
+        text, keyboard = await _build_job_detail(job_id)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif query.data.startswith("cmd_sched_settime_"):
+        job_id = query.data[len("cmd_sched_settime_"):]
+        if job_id not in SCHEDULE_JOBS:
+            await query.answer("Unknown job.", show_alert=True)
+            return
+        cfg = SCHEDULE_JOBS[job_id]
+        current_t = await config_service.get_job_time(job_id)
+        context.user_data["awaiting_schedule_time_for"] = job_id
+        text = (
+            f"⏰ *Set Time — {cfg['name']}*\n"
+            f"_{cfg['description']}_\n"
+            f"\n"
+            f"Current time: `{current_t}` (Dhaka / GMT+6)\n"
+            f"\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"*Instructions:*\n"
+            f"Send the new time in *24-hour HH:MM* format.\n"
+            f"\n"
+            f"*Valid examples:*\n"
+            f"  `06:00`  →  6:00 AM\n"
+            f"  `12:00`  →  12:00 PM (Noon)\n"
+            f"  `18:30`  →  6:30 PM\n"
+            f"  `23:59`  →  11:59 PM\n"
+            f"\n"
+            f"_Hours must be 00–23, minutes 00–59._"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cmd_sched_job_{job_id}")
+        ]])
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif query.data.startswith("cmd_sched_toggle_"):
+        job_id = query.data[len("cmd_sched_toggle_"):]
+        if job_id not in SCHEDULE_JOBS:
+            await query.answer("Unknown job.", show_alert=True)
+            return
+        from src.scheduler.report_scheduler import toggle_job_enabled
+        new_state = await toggle_job_enabled(job_id)
+        if new_state is None:
+            await query.answer("This alert cannot be toggled.", show_alert=True)
+            return
+        cfg = SCHEDULE_JOBS[job_id]
+        status_word = "enabled ✅" if new_state else "disabled 🔴"
+        await query.answer(f"{cfg['name']} {status_word}", show_alert=False)
+        # Refresh the job detail card
+        text, keyboard = await _build_job_detail(job_id)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    # ── End Schedule & Alert Settings ─────────────────────────────────────
+
     elif query.data == "cmd_generate_invite":
         await generate_invite_command(update, context)
     elif query.data == "cmd_gen_invite_FACEBOOK":
-        await _do_generate_invite(update, PlatformEnum.FACEBOOK)
+        await _do_generate_invite(update, context, PlatformEnum.FACEBOOK)
     elif query.data == "cmd_gen_invite_WHATSAPP":
-        await _do_generate_invite(update, PlatformEnum.WHATSAPP)
+        await _do_generate_invite(update, context, PlatformEnum.WHATSAPP)
     elif query.data == "cmd_list_mods":
         await list_mod_command(update, context)
     elif query.data == "cmd_manage_bans":
@@ -919,7 +1361,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # --- Admin: Update Stock from low stock alert button ---
     elif query.data.startswith("cmd_admin_setstock_"):
-        if role != RoleEnum.ADMIN:
+        if role not in ADMIN_ROLES:
             await query.answer("⛔ Only admins can update stock.", show_alert=True)
             return
         product_name = query.data.replace("cmd_admin_setstock_", "")
@@ -989,9 +1431,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
     elif query.data == "cmd_main_menu":
+        context.user_data.pop("awaiting_sa_client_name", None)
+        context.user_data.pop("awaiting_sa_bot_token", None)
+        context.user_data.pop("awaiting_sa_sheet_id", None)
+        
         user_id = str(query.from_user.id)
         role = await get_user_role(user_id)
-        if role == RoleEnum.ADMIN:
+        if role == RoleEnum.SUPERADMIN:
+            await query.edit_message_text(
+                "Welcome back, Owner!\n\nThis is the Superadmin control panel. You can manage your clients, active bots, and platform configuration here.",
+                parse_mode="Markdown",
+                reply_markup=get_superadmin_menu_keyboard()
+            )
+        elif role in ADMIN_ROLES:
             await query.edit_message_text("Welcome to the Multi-Platform Order Tracking Agent 🤖\n\nPlease select an option below:", reply_markup=get_main_menu_keyboard())
         else:
             await query.edit_message_text("Welcome back! Use the keyboard below to check your stats or just send an #ORDER.")
@@ -1000,7 +1452,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if str(query.from_user.id) != str(settings.TELEGRAM_CHAT_ID):
             await query.answer("⛔ Only the primary admin can manage admin access.", show_alert=True)
             return
-        secondary = await get_secondary_admin()
+        secondary = await get_tenant_admin(get_tenant_id())
         if secondary:
             text = (
                 f"👑 *Admin Management*\n\n"
@@ -1027,13 +1479,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
     elif query.data == "cmd_gen_admin_invite":
-        code = await generate_admin_invite_code()
+        code = await generate_admin_invite_code(get_tenant_id())
         if code is None:
             await query.answer("⚠️ A secondary admin already exists. Remove them first.", show_alert=True)
         else:
+            bot_username = getattr(context.bot, "username", None)
+            invite_link = _build_invite_link(bot_username, code)
             forward_msg = (
                 f"👑 *You have been invited as an Admin!*\n\n"
-                f"Open the bot @SME\\_management\\_bot and send:\n"
+                f"{invite_link + chr(10) + chr(10) if invite_link else ''}"
+                f"Open the bot @{bot_username} and send:\n"
                 f"`/join {code}`\n\n"
                 f"This code can only be used once."
             )
@@ -1046,7 +1501,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif query.data.startswith("cmd_remove_admin_"):
         admin_id = query.data.replace("cmd_remove_admin_", "")
-        success = await remove_secondary_admin(admin_id)
+        success = await remove_tenant_admin(admin_id, get_tenant_id())
         if success:
             await query.edit_message_text(
                 "✅ *Secondary admin removed successfully.*",
@@ -1071,21 +1526,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         text = (
             "📊 **Manage Spreadsheet Connection**\n\n"
-            f"Status: {status}\n\n"
-            "**Instructions:**\n"
-            "1. Create a Google Spreadsheet.\n"
-            f"2. Share it with this email (Editor access):\n`{email}`\n"
-            "3. Click the button below to link it to the bot.\n"
+            f"**Status:** {status}\n\n"
+            "📌 **How to connect a new Spreadsheet:**\n"
+            "1️⃣ **Create:** Open Google Sheets and create a new blank spreadsheet.\n"
+            "2️⃣ **Share:** Click the blue *Share* button in the top right corner.\n"
+            f"3️⃣ **Add Bot:** Paste this exact email address and give it **Editor** access:\n`{email}`\n"
+            "4️⃣ **Link:** Tap the *🔗 Set/Change Connection* button below.\n"
+            "5️⃣ **Submit:** The bot will ask for the URL. Simply copy the link to your spreadsheet from your browser and send it to the bot.\n"
         )
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔗 Set/Change Connection", callback_data="cmd_prompt_sheet_name")],
-            [InlineKeyboardButton("🔙 Back to Settings", callback_data="cmd_settings")]
-        ])
+        buttons = [
+            [InlineKeyboardButton("🔗 Set/Change Connection", callback_data="cmd_prompt_sheet_name")]
+        ]
+        if sheet_name:
+            buttons.append([InlineKeyboardButton("❌ Disconnect Spreadsheet", callback_data="cmd_disconnect_sheets")])
+        buttons.append([InlineKeyboardButton("🔙 Back to Settings", callback_data="cmd_settings")])
+        
+        keyboard = InlineKeyboardMarkup(buttons)
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif query.data == "cmd_disconnect_sheets":
+        await config_service.set_active_sheet_name(None)
+        await config_service.set_active_sheet_url(None)
+        await query.edit_message_text(
+            "✅ **Spreadsheet Disconnected**\n\nThe bot will no longer sync orders to Google Sheets.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Settings", callback_data="cmd_settings")]])
+        )
 
     elif query.data == "cmd_prompt_sheet_name":
         context.user_data["awaiting_sheet_name"] = True
-        text = "📝 **Please send the exact name of your Google Spreadsheet.**\n\n*(Make sure you have already shared it with the service account email!)*"
+        text = (
+            "📝 **Send the Google Spreadsheet URL**\n\n"
+            "Please paste the full link (URL) of your Google Spreadsheet here. "
+            "You can also send just the Spreadsheet ID if you prefer.\n\n"
+            "*(⚠️ Reminder: Before linking, please make sure you completed step 3 and added the bot's email to your spreadsheet's Share settings!)*"
+        )
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_manage_sheets")]])
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
@@ -1102,7 +1577,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 return
 
             # Moderators can only mark their own orders as paid
-            if role != RoleEnum.ADMIN and order.created_by_id != user_id:
+            if role not in ADMIN_ROLES and order.created_by_id != user_id:
                 await query.answer("⛔ You can only mark your own orders as paid.", show_alert=True)
                 return
 
@@ -1241,16 +1716,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # --- Cancel order: confirm step ---
     elif query.data.startswith("cmd_cancel_"):
         order_id = query.data.replace("cmd_cancel_", "")
+        async with async_session() as session:
+            result = await session.execute(select(Order).where(Order.order_id == order_id))
+            order = result.scalar_one_or_none()
+            if not order:
+                await query.answer("❌ Order not found.", show_alert=True)
+                return
+            if order.payment_status == PaymentStatusEnum.PAID:
+                await query.answer("⛔ You cannot cancel a paid order.", show_alert=True)
+                return
+
         await query.edit_message_text(
-            f"⚠️ *Cancel Order `{order_id}`?*\n\nThis will permanently delete the order.",
+            f"⚠️ *Cancel Order `{order_id}`?*\n\nThis will mark the order as cancelled and restore its stock.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🗑️ Yes, Delete It", callback_data=f"cmd_confirmcancel_{order_id}")],
+                [InlineKeyboardButton("🚫 Yes, Cancel It", callback_data=f"cmd_confirmcancel_{order_id}")],
                 [InlineKeyboardButton("↩️ No, Keep It",   callback_data="cmd_main_menu")]
             ])
         )
 
-    # --- Cancel order: confirmed, delete ---
+    # --- Cancel order: confirmed, cancel ---
     elif query.data.startswith("cmd_confirmcancel_"):
         order_id = query.data.replace("cmd_confirmcancel_", "")
         async with async_session() as session:
@@ -1259,10 +1744,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if not order:
                 await query.answer("❌ Order not found.", show_alert=True)
                 return
-            await session.delete(order)
+            if order.payment_status == PaymentStatusEnum.PAID:
+                await query.answer("⛔ You cannot cancel a paid order.", show_alert=True)
+                return
+            
+            # Stock reversal
+            from src.db.models import Product
+            prod_res = await session.execute(select(Product).where(Product.name == order.product_name))
+            prod = prod_res.scalar_one_or_none()
+            # If product exists and stock was being tracked (or if we want to just add it back anyway, but let's just add it back if we can)
+            if prod:
+                prod.current_stock += order.quantity
+
+            order.payment_status = PaymentStatusEnum.CANCELLED
             await session.commit()
+            
+        import asyncio as _asyncio
+        _asyncio.create_task(sheets.update_payment_status_in_sheets(order_id, "CANCELLED"))
+        
         await query.edit_message_text(
-            f"🗑️ Order `{order_id}` has been cancelled and removed.",
+            f"🗑️ Order `{order_id}` has been cancelled and stock returned.",
             parse_mode="Markdown"
         )
 
@@ -1357,11 +1858,63 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Processes incoming text messages for orders."""
     text = update.effective_message.text
 
+    if context.user_data.get("awaiting_sa_client_name"):
+        context.user_data["sa_new_client_name"] = text.strip()
+        context.user_data["awaiting_sa_client_name"] = False
+        context.user_data["awaiting_sa_bot_token"] = True
+        await update.effective_message.reply_text(
+            "✅ Name saved.\n\n"
+            "*Step 2 of 3:*\n"
+            "Please send the **Telegram Bot Token** for this new client\n_(get this from @BotFather)_:", 
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]])
+        )
+        return
+
+    if context.user_data.get("awaiting_sa_bot_token"):
+        context.user_data["sa_new_client_token"] = text.strip()
+        context.user_data["awaiting_sa_bot_token"] = False
+        context.user_data["awaiting_sa_sheet_id"] = True
+        await update.effective_message.reply_text(
+            "✅ Token saved.\n\n"
+            "*Step 3 of 3:*\n"
+            "Please send the **Google Sheet Name or ID** you want to link.\n\n"
+            "_(If you don't want to link one right now, just type `skip`)_", 
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]])
+        )
+        return
+
+    if context.user_data.get("awaiting_sa_sheet_id"):
+        sheet_input = text.strip()
+        if sheet_input.lower() == "skip":
+            sheet_input = None
+        context.user_data["sa_new_client_sheet"] = sheet_input
+        context.user_data["awaiting_sa_sheet_id"] = False
+        
+        name = context.user_data["sa_new_client_name"]
+        token = context.user_data["sa_new_client_token"]
+        sheet = context.user_data["sa_new_client_sheet"]
+        
+        msg = (
+            "📝 **Confirm New Client Details**\n\n"
+            f"**Name:** {name}\n"
+            f"**Token:** `{token}`\n"
+            f"**Sheet:** {sheet or 'None'}\n\n"
+            "Does everything look correct?"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm & Create", callback_data="cmd_sa_confirm_client")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]
+        ])
+        await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=keyboard)
+        return
+
     # Handle persistent keyboard "Main Menu" button tap
     if text and text.strip() == "🏠 Main Menu":
         user_id = str(update.effective_user.id)
         role = await get_user_role(user_id)
-        if role == RoleEnum.ADMIN:
+        if role in ADMIN_ROLES:
             await update.effective_message.reply_text("📌 Quick access menu updated.", reply_markup=get_persistent_keyboard())
             await update.effective_message.reply_text(
                 "Welcome to the Multi-Platform Order Tracking Agent 🤖\n\nPlease select an option below:",
@@ -1409,7 +1962,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if text and text.strip() == "📊 Today's Sales":
         user_id = str(update.effective_user.id)
         role = await get_user_role(user_id)
-        if role == RoleEnum.ADMIN:
+        if role in ADMIN_ROLES:
             await today_command(update, context)
         return
 
@@ -1430,7 +1983,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await update.effective_message.reply_text(f"❌ Order `{order_id}` not found.", parse_mode="Markdown")
                     return
                 # Moderators can only edit their own orders
-                if role != RoleEnum.ADMIN and order.created_by_id != user_id:
+                if role not in ADMIN_ROLES and order.created_by_id != user_id:
                     await update.effective_message.reply_text("⛔ You can only edit your own orders.", parse_mode="Markdown")
                     return
                 try:
@@ -1466,7 +2019,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
 
-        if role == RoleEnum.ADMIN:
+        if role in ADMIN_ROLES:
             # --- Handle awaiting search query ---
             if context.user_data.get("awaiting_search"):
                 context.user_data["awaiting_search"] = False
@@ -1516,24 +2069,72 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             # Check if we are waiting for a spreadsheet name
             if context.user_data.get("awaiting_sheet_name"):
-                sheet_name = text.strip()
-                await update.effective_message.reply_text(f"⏳ Verifying connection to: `{sheet_name}`...", parse_mode="Markdown")
+                input_text = text.strip()
+                import re
                 
-                result = await check_google_sheets_connection(sheet_name)
+                # Extract ID if a full URL is provided
+                match = re.search(r"/d/([a-zA-Z0-9-_]+)", input_text)
+                sheet_id = match.group(1) if match else input_text
+                
+                await update.effective_message.reply_text(f"⏳ Verifying connection to ID: `{sheet_id}`...", parse_mode="Markdown")
+
+                result = await check_google_sheets_connection(sheet_id)
                 if result["success"]:
-                    await config_service.set_active_sheet_name(sheet_name)
+                    await config_service.set_active_sheet_name(sheet_id)
                     await config_service.set_active_sheet_url(result["url"])
                     context.user_data["awaiting_sheet_name"] = False
-                    msg = f"✅ **Success!** Linked to: `{sheet_name}`\n\nAll new orders will now be synced to this spreadsheet."
+                    msg = f"✅ **Success!** Linked to Spreadsheet ID: `{sheet_id}`\n\nAll new orders will now be synced to this spreadsheet."
                     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Open Main Menu", callback_data="cmd_main_menu")]])
                     await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=keyboard)
                 else:
-                    msg = f"❌ **Connection Failed**\n\nError: {result['error']}\n\nPlease make sure the name is exact and the sheet is shared with the service account email."
+                    msg = f"❌ **Connection Failed**\n\nError: {result['error']}\n\nPlease make sure the ID/URL is correct and the sheet is shared with the service account email."
                     keyboard = InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔄 Try Again", callback_data="cmd_prompt_sheet_name")],
                         [InlineKeyboardButton("❌ Cancel", callback_data="cmd_manage_sheets")]
                     ])
                     await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=keyboard)
+                return
+
+            # --- Handle awaiting schedule time input ---
+            if context.user_data.get("awaiting_schedule_time_for"):
+                import re
+                job_id = context.user_data["awaiting_schedule_time_for"]
+                time_input = text.strip()
+                if not re.match(r"^\d{1,2}:\d{2}$", time_input):
+                    await update.effective_message.reply_text(
+                        "❌ *Invalid format.*\n\nPlease send the time as `HH:MM` (24-hour).\nExample: `21:30` for 9:30 PM",
+                        parse_mode="Markdown"
+                    )
+                    return
+                parts = time_input.split(":")
+                h, m = int(parts[0]), int(parts[1])
+                if not (0 <= h <= 23 and 0 <= m <= 59):
+                    await update.effective_message.reply_text(
+                        "❌ *Invalid time.*\n\nHours must be 00–23 and minutes 00–59.\nExample: `23:59` for 11:59 PM",
+                        parse_mode="Markdown"
+                    )
+                    return
+                context.user_data.pop("awaiting_schedule_time_for")
+                from src.scheduler.report_scheduler import reschedule_job_time
+                success = await reschedule_job_time(job_id, h, m)
+                if success:
+                    job_name = SCHEDULE_JOBS[job_id]["name"]
+                    keyboard = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("⚙️ Back to Schedule", callback_data="cmd_schedule_menu")
+                    ]])
+                    await update.effective_message.reply_text(
+                        f"✅ *Schedule Updated!*\n\n"
+                        f"{job_name} will now run at *{h:02d}:{m:02d}* (Dhaka time).\n\n"
+                        f"_The change takes effect immediately — no restart needed._",
+                        parse_mode="Markdown",
+                        reply_markup=keyboard
+                    )
+                else:
+                    context.user_data["awaiting_schedule_time_for"] = job_id
+                    await update.effective_message.reply_text(
+                        "❌ Failed to update the schedule. Please try again.",
+                        parse_mode="Markdown"
+                    )
                 return
 
             msg = "🤔 **I didn't quite understand that.**\n\n*(You are an Admin. Are you trying to access your Dashboard?)*"
@@ -1661,7 +2262,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # If platform still unknown, admin defaults to TELEGRAM; moderator must tag
     if final_platform is None:
         user_role = await _get_role(user_id)
-        if user_role == RoleEnum.ADMIN:
+        if user_role in ADMIN_ROLES:
             final_platform = PlatformEnum.TELEGRAM
         else:
             await update.effective_message.reply_text(

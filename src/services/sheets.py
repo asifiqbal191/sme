@@ -1,5 +1,6 @@
 import gspread
 import asyncio
+import os
 from typing import Dict, Any
 from src.core.config import settings
 from google.oauth2.service_account import Credentials
@@ -11,7 +12,43 @@ logger = logging.getLogger(__name__)
 # Serialize all sheet appends to prevent race conditions from concurrent orders
 _sheets_lock = asyncio.Lock()
 
-async def push_to_google_sheets(order_data: Dict[str, Any]):
+_cached_client = None
+
+def _get_gspread_client():
+    global _cached_client
+    if _cached_client is not None:
+        return _cached_client
+    
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    
+    # 1. Try Loading from JSON string (Railway/Production priority)
+    if settings.GOOGLE_CREDENTIALS_JSON:
+        import json
+        try:
+            info = json.loads(settings.GOOGLE_CREDENTIALS_JSON)
+            creds = Credentials.from_service_account_info(info, scopes=scopes)
+            logger.info("Authorized Google Sheets using GOOGLE_CREDENTIALS_JSON.")
+        except Exception as e:
+            logger.error(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
+            raise e
+    else:
+        # 2. Fallback to File (Local Development)
+        if not os.path.exists(settings.GOOGLE_CREDENTIALS_FILE):
+             raise FileNotFoundError(f"Credentials file '{settings.GOOGLE_CREDENTIALS_FILE}' not found")
+             
+        creds = Credentials.from_service_account_file(
+            settings.GOOGLE_CREDENTIALS_FILE, 
+            scopes=scopes
+        )
+        logger.info(f"Authorized Google Sheets using {settings.GOOGLE_CREDENTIALS_FILE}.")
+        
+    _cached_client = gspread.authorize(creds)
+    return _cached_client
+
+async def _execute_append_order(order_data: Dict[str, Any]):
     """
     Appends an order row to Google Sheets concurrently.
     The order_data dict should have keys like:
@@ -24,18 +61,15 @@ async def push_to_google_sheets(order_data: Dict[str, Any]):
 
     def _sync_append():
         try:
-            creds = Credentials.from_service_account_file(
-                settings.GOOGLE_CREDENTIALS_FILE, 
-                scopes=[
-                    "https://www.googleapis.com/auth/spreadsheets",
-                    "https://www.googleapis.com/auth/drive"
-                ]
-            )
-            client = gspread.authorize(creds)
+            client = _get_gspread_client()
             
             # Open spreadsheet and worksheet
             try:
-                sheet = client.open(sheet_name).sheet1
+                try:
+                    sheet = client.open_by_key(sheet_name).sheet1
+                except Exception:
+                    # Fallback to name if it's not a valid ID
+                    sheet = client.open(sheet_name).sheet1
                 
                 # Ensure headers exist
                 first_row = sheet.row_values(1)
@@ -50,7 +84,7 @@ async def push_to_google_sheets(order_data: Dict[str, Any]):
                     logger.info("Updated headers in Google Sheet to include new columns.")
                     
             except gspread.exceptions.SpreadsheetNotFound:
-                logger.error(f"Google Sheet '{settings.GOOGLE_SHEET_NAME}' not found.")
+                logger.error(f"Google Sheet '{sheet_name}' not found.")
                 return
             
             # Format row: Order ID | Product | Qty | Price | Platform | Timestamp | Status | Phone
@@ -79,13 +113,13 @@ async def push_to_google_sheets(order_data: Dict[str, Any]):
             # Detailed Debug Logging
             print("Error pushing to Google Sheets:", str(e))
             logger.error(f"Failed to append to Google Sheets: {e}")
-            logger.error(f"Sheet Name: {settings.GOOGLE_SHEET_NAME}")
+            logger.error(f"Sheet Name: {sheet_name}")
             logger.error(f"Data sent: {row if 'row' in locals() else 'None'}")
             raise e
 
     # Serialize appends to prevent race conditions when multiple orders arrive simultaneously
     async with _sheets_lock:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _sync_append)
 
 async def check_google_sheets_connection(sheet_name: str = None):
@@ -101,17 +135,13 @@ async def check_google_sheets_connection(sheet_name: str = None):
 
     def _sync_check():
         try:
-            creds = Credentials.from_service_account_file(
-                settings.GOOGLE_CREDENTIALS_FILE, 
-                scopes=[
-                    "https://www.googleapis.com/auth/spreadsheets",
-                    "https://www.googleapis.com/auth/drive"
-                ]
-            )
-            client = gspread.authorize(creds)
+            client = _get_gspread_client()
             
             try:
-                sheet = client.open(sheet_name).sheet1
+                try:
+                    sheet = client.open_by_key(sheet_name).sheet1
+                except Exception:
+                    sheet = client.open(sheet_name).sheet1
                 count = len(sheet.get_all_values())
                 url = sheet.url
                 return {"success": True, "count": count, "url": url}
@@ -124,10 +154,10 @@ async def check_google_sheets_connection(sheet_name: str = None):
         except Exception as e:
             return {"success": False, "error": f"❌ Connection failed: {str(e)}"}
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _sync_check)
 
-async def update_order_field_in_sheets(order_id: str, field: str, new_value):
+async def _execute_update_field(order_id: str, field: str, new_value):
     """
     Finds the row for order_id and updates a single field column.
     field: 'product' | 'qty' | 'price' | 'phone'
@@ -145,15 +175,11 @@ async def update_order_field_in_sheets(order_id: str, field: str, new_value):
 
     def _sync_update():
         try:
-            creds = Credentials.from_service_account_file(
-                settings.GOOGLE_CREDENTIALS_FILE,
-                scopes=[
-                    "https://www.googleapis.com/auth/spreadsheets",
-                    "https://www.googleapis.com/auth/drive"
-                ]
-            )
-            client = gspread.authorize(creds)
-            sheet = client.open(sheet_name).sheet1
+            client = _get_gspread_client()
+            try:
+                sheet = client.open_by_key(sheet_name).sheet1
+            except Exception:
+                sheet = client.open(sheet_name).sheet1
             try:
                 cell = sheet.find(order_id, in_column=1)
                 if cell:
@@ -165,12 +191,13 @@ async def update_order_field_in_sheets(order_id: str, field: str, new_value):
                 logger.warning(f"Order {order_id} not found in Google Sheets. Could not update {field}.")
         except Exception as e:
             logger.error(f"Failed to update field '{field}' in Sheets for {order_id}: {e}")
+            raise e
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _sync_update)
 
 
-async def update_payment_status_in_sheets(order_id: str, new_status: str):
+async def _execute_update_status(order_id: str, new_status: str):
     """
     Finds the row for order_id in Google Sheets and updates its Status.
     """
@@ -181,15 +208,11 @@ async def update_payment_status_in_sheets(order_id: str, new_status: str):
 
     def _sync_update():
         try:
-            creds = Credentials.from_service_account_file(
-                settings.GOOGLE_CREDENTIALS_FILE, 
-                scopes=[
-                    "https://www.googleapis.com/auth/spreadsheets",
-                    "https://www.googleapis.com/auth/drive"
-                ]
-            )
-            client = gspread.authorize(creds)
-            sheet = client.open(sheet_name).sheet1
+            client = _get_gspread_client()
+            try:
+                sheet = client.open_by_key(sheet_name).sheet1
+            except Exception:
+                sheet = client.open(sheet_name).sheet1
             
             # Find the cell containing the order ID
             try:
@@ -203,7 +226,20 @@ async def update_payment_status_in_sheets(order_id: str, new_status: str):
                 
         except Exception as e:
             logger.error(f"Failed to update payment status in Sheets for {order_id}: {e}")
+            raise e
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _sync_update)
 
+
+async def push_to_google_sheets(order_data: Dict[str, Any]):
+    from src.services.sheet_sync import enqueue_and_process_sync
+    await enqueue_and_process_sync("APPEND_ORDER", order_data)
+
+async def update_order_field_in_sheets(order_id: str, field: str, new_value):
+    from src.services.sheet_sync import enqueue_and_process_sync
+    await enqueue_and_process_sync("UPDATE_FIELD", {"order_id": order_id, "field": field, "new_value": new_value})
+
+async def update_payment_status_in_sheets(order_id: str, new_status: str):
+    from src.services.sheet_sync import enqueue_and_process_sync
+    await enqueue_and_process_sync("UPDATE_STATUS", {"order_id": order_id, "new_status": new_status})

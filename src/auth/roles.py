@@ -5,36 +5,79 @@ from telegram import Update
 from telegram.ext import ContextTypes
 from sqlalchemy.future import select
 
+from src.core.context import get_tenant_id, normalize_tenant_id, without_tenant_scope
 from src.db.session import async_session
 from src.db.models import User, RoleEnum, Invite, PlatformEnum
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
+ADMIN_ROLES = (RoleEnum.ADMIN, RoleEnum.SUPERADMIN)
+MANAGEMENT_ROLES = (RoleEnum.ADMIN, RoleEnum.MODERATOR, RoleEnum.SUPERADMIN)
+
+def _resolve_target_tenant_id(tenant_id: str | None = None) -> str | None:
+    return normalize_tenant_id(tenant_id or get_tenant_id())
+
+async def _ensure_primary_superadmin(telegram_id: str) -> RoleEnum | None:
+    if str(telegram_id) != str(settings.TELEGRAM_CHAT_ID):
+        return None
+
+    with without_tenant_scope():
+        async with async_session() as session:
+            result = await session.execute(
+                select(User).where(
+                    User.telegram_id == telegram_id,
+                    User.role == RoleEnum.SUPERADMIN,
+                    User.tenant_id == None,  # noqa: E711
+                )
+            )
+            user = result.scalar_one_or_none()
+            if user:
+                return None if user.is_banned else RoleEnum.SUPERADMIN
+
+            logger.info("Auto-promoting %s to SUPERADMIN from config.", telegram_id)
+            session.add(
+                User(
+                    telegram_id=telegram_id,
+                    role=RoleEnum.SUPERADMIN,
+                    tenant_id=None,
+                )
+            )
+            await session.commit()
+            return RoleEnum.SUPERADMIN
 
 async def get_user_role(telegram_id: str) -> RoleEnum | None:
+    superadmin_role = await _ensure_primary_superadmin(telegram_id)
+    if superadmin_role is not None:
+        return superadmin_role
+
     async with async_session() as session:
         result = await session.execute(select(User).where(User.telegram_id == telegram_id))
         user = result.scalar_one_or_none()
-        
-        # Auto-promote configured admin if no role is found
-        if not user and str(telegram_id) == str(settings.TELEGRAM_CHAT_ID):
-            logger.info(f"Auto-promoting {telegram_id} to ADMIN from config.")
-            new_admin = User(telegram_id=telegram_id, role=RoleEnum.ADMIN)
-            session.add(new_admin)
-            await session.commit()
-            return RoleEnum.ADMIN
-            
+
         if user and user.is_banned:
             return None
-            
+
         return user.role if user else None
+
+def require_superadmin(func):
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = str(update.effective_user.id)
+        if user_id != str(settings.TELEGRAM_CHAT_ID):
+            if update.effective_message:
+                await update.effective_message.reply_text("⛔ Access Denied. Superadmin privileges required.")
+            elif update.callback_query:
+                await update.callback_query.answer("⛔ Access Denied. Superadmin privileges required.", show_alert=True)
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
 
 def require_admin(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = str(update.effective_user.id)
         role = await get_user_role(user_id)
-        if role != RoleEnum.ADMIN:
+        if role not in ADMIN_ROLES:
             if update.effective_message:
                 if role == RoleEnum.MODERATOR:
                     await update.effective_message.reply_text("⛔ Access Denied. Admin privileges required to view or click this.")
@@ -52,7 +95,7 @@ def require_moderator_or_admin(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = str(update.effective_user.id)
         role = await get_user_role(user_id)
-        if role not in (RoleEnum.ADMIN, RoleEnum.MODERATOR):
+        if role not in MANAGEMENT_ROLES:
             if update.effective_message:
                 msg = "⛔ **Access Denied**\n\nYou are not connected yet! To get access, please enter the invitation code provided by your Admin like so:\n\n👉 `/join INV-XXXX`"
                 await update.effective_message.reply_text(msg, parse_mode="Markdown")
@@ -62,28 +105,57 @@ def require_moderator_or_admin(func):
         return await func(update, context, *args, **kwargs)
     return wrapper
 
-async def generate_invite_code(platform: PlatformEnum = None) -> str:
+async def generate_invite_code(platform: PlatformEnum = None, tenant_id: str | None = None) -> str:
     code = f"INV-{secrets.token_hex(4).upper()}"
-    async with async_session() as session:
-        invite = Invite(code=code, platform=platform, role=RoleEnum.MODERATOR)
-        session.add(invite)
-        await session.commit()
-    return code
+    target_tenant_id = _resolve_target_tenant_id(tenant_id)
 
-async def generate_admin_invite_code() -> str | None:
-    """Generates a one-time admin invite. Returns None if a secondary admin already exists."""
+    if tenant_id is not None:
+        with without_tenant_scope():
+            async with async_session() as session:
+                session.add(
+                    Invite(
+                        code=code,
+                        platform=platform,
+                        role=RoleEnum.MODERATOR,
+                        tenant_id=target_tenant_id,
+                    )
+                )
+                await session.commit()
+                return code
+
     async with async_session() as session:
-        existing = await session.execute(
-            select(User).where(User.role == RoleEnum.ADMIN, User.telegram_id != settings.TELEGRAM_CHAT_ID)
+        session.add(
+            Invite(
+                code=code,
+                platform=platform,
+                role=RoleEnum.MODERATOR,
+                tenant_id=target_tenant_id,
+            )
         )
-        if existing.scalar_one_or_none():
-            return None  # Already has a secondary admin
-
-        code = f"ADM-{secrets.token_hex(4).upper()}"
-        invite = Invite(code=code, role=RoleEnum.ADMIN)
-        session.add(invite)
         await session.commit()
-    return code
+        return code
+
+async def generate_admin_invite_code(tenant_id: str | None = None) -> str | None:
+    """Generate a one-time tenant admin invite."""
+    target_tenant_id = _resolve_target_tenant_id(tenant_id)
+    if target_tenant_id is None:
+        return None
+
+    with without_tenant_scope():
+        async with async_session() as session:
+            existing = await session.execute(
+                select(User).where(
+                    User.role == RoleEnum.ADMIN,
+                    User.tenant_id == target_tenant_id,
+                )
+            )
+            if existing.scalar_one_or_none():
+                return None
+
+            code = f"ADM-{secrets.token_hex(4).upper()}"
+            session.add(Invite(code=code, role=RoleEnum.ADMIN, tenant_id=target_tenant_id))
+            await session.commit()
+            return code
 
 async def redeem_invite_code(telegram_id: str, full_name: str, code: str) -> bool | str:
     """Returns True if successful, or an error string."""
@@ -100,52 +172,72 @@ async def redeem_invite_code(telegram_id: str, full_name: str, code: str) -> boo
         if user:
             return "You are already registered."
 
-        # For admin invites, enforce max 1 secondary admin
+        # For admin invites, enforce max 1 tenant admin
         if invite.role == RoleEnum.ADMIN:
-            existing = await session.execute(
-                select(User).where(User.role == RoleEnum.ADMIN, User.telegram_id != settings.TELEGRAM_CHAT_ID)
-            )
-            if existing.scalar_one_or_none():
-                return "Admin slot is already filled. Contact your primary admin."
+            with without_tenant_scope():
+                existing = await session.execute(
+                    select(User).where(
+                        User.role == RoleEnum.ADMIN,
+                        User.tenant_id == invite.tenant_id,
+                    )
+                )
+                if existing.scalar_one_or_none():
+                    return "Admin slot is already filled for this client."
 
         # Mark invite and create user with the role from the invite
-        assigned_role = invite.role
         invite.is_used = True
         invite.used_by = telegram_id
 
-        new_user = User(telegram_id=telegram_id, full_name=full_name, role=assigned_role, platform=invite.platform)
+        new_user = User(
+            telegram_id=telegram_id,
+            full_name=full_name,
+            role=invite.role,
+            platform=invite.platform,
+            tenant_id=invite.tenant_id,
+        )
         session.add(new_user)
         session.add(invite)
         await session.commit()
-        return assigned_role
+        return invite.role
 
-async def get_secondary_admin() -> dict | None:
-    """Returns the secondary admin (non-primary) if one exists."""
-    async with async_session() as session:
-        result = await session.execute(
-            select(User).where(User.role == RoleEnum.ADMIN, User.telegram_id != settings.TELEGRAM_CHAT_ID)
-        )
-        user = result.scalar_one_or_none()
-        if user:
-            return {"id": user.telegram_id, "name": user.full_name or "Unknown"}
+async def get_tenant_admin(tenant_id: str | None = None) -> dict | None:
+    target_tenant_id = _resolve_target_tenant_id(tenant_id)
+    if target_tenant_id is None:
         return None
 
-async def remove_secondary_admin(telegram_id: str) -> bool:
-    """Removes a secondary admin. Cannot remove the primary admin."""
-    async with async_session() as session:
-        result = await session.execute(
-            select(User).where(
-                User.telegram_id == telegram_id,
-                User.role == RoleEnum.ADMIN,
-                User.telegram_id != settings.TELEGRAM_CHAT_ID
+    with without_tenant_scope():
+        async with async_session() as session:
+            result = await session.execute(
+                select(User).where(
+                    User.role == RoleEnum.ADMIN,
+                    User.tenant_id == target_tenant_id,
+                )
             )
-        )
-        user = result.scalar_one_or_none()
-        if user:
-            await session.delete(user)
-            await session.commit()
-            return True
+            user = result.scalar_one_or_none()
+            if user:
+                return {"id": user.telegram_id, "name": user.full_name or "Unknown"}
+            return None
+
+async def remove_tenant_admin(telegram_id: str, tenant_id: str | None = None) -> bool:
+    target_tenant_id = _resolve_target_tenant_id(tenant_id)
+    if target_tenant_id is None:
         return False
+
+    with without_tenant_scope():
+        async with async_session() as session:
+            result = await session.execute(
+                select(User).where(
+                    User.telegram_id == telegram_id,
+                    User.role == RoleEnum.ADMIN,
+                    User.tenant_id == target_tenant_id,
+                )
+            )
+            user = result.scalar_one_or_none()
+            if user:
+                await session.delete(user)
+                await session.commit()
+                return True
+            return False
 
 async def add_moderator(telegram_id: str, full_name: str = None) -> bool:
     async with async_session() as session:
@@ -163,7 +255,7 @@ async def set_ban_status(telegram_id: str, is_banned: bool) -> bool:
     async with async_session() as session:
         result = await session.execute(select(User).where(User.telegram_id == telegram_id))
         user = result.scalar_one_or_none()
-        if user and user.role != RoleEnum.ADMIN:
+        if user and user.role not in ADMIN_ROLES:
             user.is_banned = is_banned
             await session.commit()
             return True

@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     POSTGRES_PORT: str = "5432"
     POSTGRES_DB: str = "ordertracker"
 
+    # Web Dashboard
+    DASHBOARD_URL: str = "https://your-sme-app.up.railway.app/dashboard"
+
     # Telegram Bot
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""  # Primary admin chat ID (used for auto-promotion)
@@ -30,10 +33,27 @@ class Settings(BaseSettings):
     # Google Sheets
     GOOGLE_SHEET_NAME: str = "Orders Dashboard"
     GOOGLE_CREDENTIALS_FILE: str = "service_account.json"
+    GOOGLE_CREDENTIALS_JSON: Optional[str] = None # For Railway/Production
+
+    DATABASE_URL: Optional[str] = None # Railway provides this
 
     @property
     def DATABASE_URI(self) -> str:
-        # Override to use SQLite for easy local testing
+        # 1. Check for full connection string (common in Railway/Supabase)
+        if self.DATABASE_URL:
+            # Convert postgres:// to postgresql+asyncpg:// for SQLAlchemy async
+            url = self.DATABASE_URL
+            if url.startswith("postgres://"):
+                url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+            elif url.startswith("postgresql://"):
+                url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+            return url
+
+        # 2. Construct from components
+        if self.POSTGRES_USER and self.POSTGRES_PASSWORD:
+            return f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        
+        # 3. Fallback to SQLite
         return "sqlite+aiosqlite:///./ordertracker.db"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")

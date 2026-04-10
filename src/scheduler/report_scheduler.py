@@ -3,9 +3,9 @@ Automated Report Scheduler
 --------------------------
 Sends daily and weekly business reports to Telegram using APScheduler.
 
-Daily Report:  Every day at 9:00 PM (Asia/Dhaka)
-Weekly Report: Every Sunday at 9:00 PM (Asia/Dhaka)
-Test Report:   Every 1 minute (for testing — disable after verification)
+Schedule times and alert on/off states are stored in the GlobalConfig DB table
+so admins can change them at runtime via the bot's Settings menu without
+restarting the server.
 """
 
 import logging
@@ -19,6 +19,7 @@ from src.core.config import settings
 from src.db.session import async_session
 from src.services import analytics
 from src.services.notifier import send_admin_alert
+from src.services import sheet_sync
 
 logger = logging.getLogger(__name__)
 
@@ -71,31 +72,30 @@ async def _generate_daily_report():
             today_stats = await analytics.get_daily_sales(session)
             total_sales = today_stats["total_sales"]
             order_count = today_stats["total_orders"]
-            
+
             # 2. Performance Insight (Today vs Yesterday)
             yesterday_stats = await analytics.get_yesterday_sales(session)
             yesterday_sales = yesterday_stats["total_sales"]
-            
+
             growth_str = "0%"
             if yesterday_sales > 0:
                 growth = ((total_sales - yesterday_sales) / yesterday_sales) * 100
                 growth_str = f"{'+' if growth >= 0 else ''}{growth:.1f}%"
             elif total_sales > 0:
                 growth_str = "+100%"
-                
+
             # 3. Product Analysis (Top product + contribution)
             top = await analytics.get_today_top_product(session)
-            
+
             # 4. Revenue Breakdown (Top 3)
-            # Use Dhaka local time (DB now stores local time)
             now_dhaka = datetime.now(DHAKA_TZ).replace(tzinfo=None)
             start_of_day = now_dhaka.replace(hour=0, minute=0, second=0, microsecond=0)
-            
+
             breakdown = await analytics.get_revenue_breakdown(session, start_of_day, now_dhaka)
-            
+
             # 5. Alert System
             LOW_SALES_THRESHOLD = 1000.0
-            LOW_ORDERS_THRESHOLD = 2 # Lowered for testing
+            LOW_ORDERS_THRESHOLD = 2
             alerts = []
             if total_sales < LOW_SALES_THRESHOLD:
                 alerts.append("⚠️ Low sales detected today")
@@ -104,20 +104,20 @@ async def _generate_daily_report():
 
             # 6. AI Recommendations
             recommendations = []
-            # Performance based
             if growth_str.startswith('+'):
                 val = float(growth_str.strip('+%'))
-                if val > 20: recommendations.append("🚀 Great growth! Celebrate and promote top product tomorrow.")
-                else: recommendations.append("📈 Steady growth. Keep your current strategy.")
+                if val > 20:
+                    recommendations.append("🚀 Great growth! Celebrate and promote top product tomorrow.")
+                else:
+                    recommendations.append("📈 Steady growth. Keep your current strategy.")
             elif growth_str.startswith('-'):
                 recommendations.append("📉 Sales are down. Consider a flash discount or checking ad campaigns.")
-            
-            # Product based
+
             if top and total_sales > 0:
                 contribution = (top["revenue"] / total_sales) * 100
                 if contribution > 50:
                     recommendations.append("🎯 One product is dominating. Consider diversifying your catalog.")
-            
+
             if total_sales == 0:
                 recommendations.append("🔍 No sales today? Check if your order parsing is working correctly.")
 
@@ -134,7 +134,7 @@ async def _generate_daily_report():
                 f"Sales Change: *{growth_str}* (vs yesterday)",
                 f""
             ]
-            
+
             if top:
                 contribution = (top["revenue"] / total_sales) * 100 if total_sales > 0 else 0
                 msg_parts.extend([
@@ -145,17 +145,17 @@ async def _generate_daily_report():
                     f"This product contributed {contribution:.1f}% of total sales",
                     f""
                 ])
-                
+
             if breakdown:
                 msg_parts.append(f"💰 *Revenue Breakdown:*")
                 for item in breakdown:
                     msg_parts.append(f"{item['product_name']} → ৳{item['revenue']:,.2f}")
                 msg_parts.append("")
-                
+
             if alerts:
                 msg_parts.extend(alerts)
                 msg_parts.append("")
-                
+
             msg_parts.append(f"🤖 *AI Recommendation:*")
             for rec in recommendations:
                 msg_parts.append(f"- {rec}")
@@ -233,7 +233,6 @@ async def _generate_monthly_report():
 async def _check_sales_drop():
     """
     Checks if today's sales are lower than yesterday's sales and sends an alert.
-    Run daily at 10:05 PM.
     """
     logger.info("Checking for sales drop...")
     try:
@@ -264,7 +263,6 @@ async def _check_sales_drop():
 async def _trending_product_alert():
     """
     Detects top-selling product of the day and notifies user.
-    Run daily at 10:10 PM.
     """
     logger.info("Checking for trending product...")
     try:
@@ -291,7 +289,6 @@ async def _trending_product_alert():
 async def _generate_growth_report():
     """
     Calculates growth (today vs yesterday) and sends report.
-    Run daily at 10:15 PM.
     """
     logger.info("Generating growth report...")
     try:
@@ -327,11 +324,11 @@ async def _generate_growth_report():
     except Exception as e:
         logger.error(f"Error generating growth report: {e}", exc_info=True)
         await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Growth Report\nError: `{str(e)[:200]}`")
-        
+
+
 async def _check_stock_prediction_alerts():
     """
     Predicts when products will run out and sends alerts for those < 5 days.
-    Run daily at 10:20 PM.
     """
     logger.info("Checking for stock prediction alerts...")
     try:
@@ -342,7 +339,6 @@ async def _check_stock_prediction_alerts():
         for p in predictions:
             days = p["days_remaining"]
             if days < 5:
-                # Format days nicely
                 days_str = f"{days:.1f}" if days > 0 else "0"
                 msg = (
                     f"📦 *Stock Alert:*\n"
@@ -353,7 +349,7 @@ async def _check_stock_prediction_alerts():
                 await _send_telegram_message(msg)
                 alerts_sent += 1
                 logger.info(f"Stock alert sent for {p['product_name']}: {days_str} days remaining.")
-        
+
         if alerts_sent == 0:
             logger.info("No stock alerts needed today.")
         else:
@@ -370,85 +366,74 @@ async def _check_stock_prediction_alerts():
 
 scheduler: AsyncIOScheduler | None = None
 
-# ── Set this to False to enable the 1-minute test job ──
+# Set this to False to disable the 1-minute test job
 TESTING_MODE = False
 
+# Maps job IDs to their generator functions
+_JOB_FUNCS = {
+    "daily_report": _generate_daily_report,
+    "weekly_report": _generate_weekly_report,
+    "monthly_report": _generate_monthly_report,
+    "sales_drop_alert": _check_sales_drop,
+    "trending_product_alert": _trending_product_alert,
+    "growth_comparison_report": _generate_growth_report,
+    "stock_prediction_alert": _check_stock_prediction_alerts,
+}
 
-def start_scheduler():
-    """Initialize and start the APScheduler AsyncIOScheduler."""
+
+def _make_trigger(job_id: str, hour: int, minute: int) -> CronTrigger:
+    """Build the correct CronTrigger for a given job ID and time."""
+    if job_id == "weekly_report":
+        return CronTrigger(day_of_week="fri", hour=hour, minute=minute, timezone=DHAKA_TZ)
+    if job_id == "monthly_report":
+        return CronTrigger(day="last", hour=hour, minute=minute, timezone=DHAKA_TZ)
+    return CronTrigger(hour=hour, minute=minute, timezone=DHAKA_TZ)
+
+
+async def start_scheduler():
+    """Initialize and start the APScheduler AsyncIOScheduler.
+
+    Times and enabled states are loaded from the DB so admin customizations
+    made via the bot's Settings menu persist across restarts.
+    """
     global scheduler
 
     if scheduler and scheduler.running:
         logger.info("Scheduler is already running.")
         return
 
-    # Use AsyncIOScheduler to run directly on the existing event loop
+    from src.services.config_service import SCHEDULE_JOBS, get_job_time, get_job_enabled
+
     scheduler = AsyncIOScheduler(timezone=DHAKA_TZ)
 
-    # ── Daily report: every day at 11:59 PM Asia/Dhaka (end of day) ──
+    # Register all report/alert jobs with DB-persisted (or default) times
+    disabled_jobs: list[str] = []
+    for job_id, job_cfg in SCHEDULE_JOBS.items():
+        time_str = await get_job_time(job_id)
+        parts = time_str.split(":")
+        h, m = int(parts[0]), int(parts[1])
+
+        scheduler.add_job(
+            _JOB_FUNCS[job_id],
+            trigger=_make_trigger(job_id, h, m),
+            id=job_id,
+            name=job_cfg["name"],
+            replace_existing=True,
+        )
+
+        # Track which alert jobs are saved as disabled
+        if job_cfg.get("enabled_key") and not await get_job_enabled(job_id):
+            disabled_jobs.append(job_id)
+
+    # Google Sheets sync retry — always on, not user-configurable
     scheduler.add_job(
-        _generate_daily_report,
-        trigger=CronTrigger(hour=23, minute=59, timezone=DHAKA_TZ),
-        id="daily_report",
-        name="Daily Sales Report",
+        sheet_sync.retry_failed_syncs,
+        trigger=IntervalTrigger(minutes=5, timezone=DHAKA_TZ),
+        id="retry_failed_sheet_syncs",
+        name="Retry Failed Google Sheets Syncs",
         replace_existing=True,
     )
 
-    # ── Weekly report: every Friday at 11:59 PM Asia/Dhaka ──
-    scheduler.add_job(
-        _generate_weekly_report,
-        trigger=CronTrigger(day_of_week="fri", hour=23, minute=59, timezone=DHAKA_TZ),
-        id="weekly_report",
-        name="Weekly Sales Report",
-        replace_existing=True,
-    )
-
-    # ── Monthly report: last day of the month at 11:59 PM Asia/Dhaka ──
-    scheduler.add_job(
-        _generate_monthly_report,
-        trigger=CronTrigger(day="last", hour=23, minute=59, timezone=DHAKA_TZ),
-        id="monthly_report",
-        name="Monthly Sales Report",
-        replace_existing=True,
-    )
-
-    # ── Sales Drop Alert: every day at 10:05 PM Asia/Dhaka ──
-    scheduler.add_job(
-        _check_sales_drop,
-        trigger=CronTrigger(hour=22, minute=5, timezone=DHAKA_TZ),
-        id="sales_drop_alert",
-        name="Sales Drop Alert",
-        replace_existing=True,
-    )
-
-    # ── Trending Product Alert: every day at 10:10 PM Asia/Dhaka ──
-    scheduler.add_job(
-        _trending_product_alert,
-        trigger=CronTrigger(hour=22, minute=10, timezone=DHAKA_TZ),
-        id="trending_product_alert",
-        name="Trending Product Alert",
-        replace_existing=True,
-    )
-
-    # ── Growth Comparison Report: every day at 10:15 PM Asia/Dhaka ──
-    scheduler.add_job(
-        _generate_growth_report,
-        trigger=CronTrigger(hour=22, minute=15, timezone=DHAKA_TZ),
-        id="growth_comparison_report",
-        name="Growth Comparison Report",
-        replace_existing=True,
-    )
-
-    # ── Stock Prediction Alert: every day at 10:20 PM Asia/Dhaka ──
-    scheduler.add_job(
-        _check_stock_prediction_alerts,
-        trigger=CronTrigger(hour=22, minute=20, timezone=DHAKA_TZ),
-        id="stock_prediction_alert",
-        name="Stock Prediction Alert",
-        replace_existing=True,
-    )
-
-    # ── Testing job: every 1 minute ──
     if TESTING_MODE:
         scheduler.add_job(
             _generate_daily_report,
@@ -457,19 +442,22 @@ def start_scheduler():
             name="Test Report (every 1 min)",
             replace_existing=True,
         )
-        # ── INITIAL TEST RUN: Fire once immediately after start ──
-        from datetime import datetime
         scheduler.add_job(
             _generate_daily_report,
             id="initial_test_run",
             name="Initial Test Run",
-            next_run_time=datetime.now(DHAKA_TZ)
+            next_run_time=datetime.now(DHAKA_TZ),
         )
-        
-        logger.info("⚠️  TESTING MODE is ON — report will fire every 1 minute (plus one immediate run).")
+        logger.info("⚠️  TESTING MODE is ON — report will fire every 1 minute.")
 
     scheduler.start()
-    logger.info("✅ Async report scheduler started successfully. Next daily report at 9:00 PM.")
+
+    # Pause disabled alert jobs now that the scheduler is running
+    for job_id in disabled_jobs:
+        scheduler.pause_job(job_id)
+        logger.info(f"Alert job '{job_id}' is disabled — paused.")
+
+    logger.info("✅ Async report scheduler started successfully.")
 
 
 def stop_scheduler():
@@ -482,5 +470,56 @@ def stop_scheduler():
 
 
 def _capture_event_loop():
-    """No-op for AsyncIOScheduler as it picks up the current loop when started."""
+    """No-op for AsyncIOScheduler — it picks up the current loop when started."""
     logger.info("AsyncIOScheduler will use the current event loop.")
+
+
+# ---------------------------------------------------------------------------
+# Runtime reschedule & toggle (called from bot handlers)
+# ---------------------------------------------------------------------------
+
+async def reschedule_job_time(job_id: str, hour: int, minute: int) -> bool:
+    """Persist the new time to DB and reschedule the live job immediately.
+
+    Returns True on success, False if the job_id is unknown or scheduler is down.
+    """
+    from src.services.config_service import SCHEDULE_JOBS, set_job_time
+
+    if job_id not in SCHEDULE_JOBS or scheduler is None:
+        return False
+
+    time_str = f"{hour:02d}:{minute:02d}"
+    await set_job_time(job_id, time_str)
+    scheduler.reschedule_job(job_id, trigger=_make_trigger(job_id, hour, minute))
+    logger.info(f"Job '{job_id}' rescheduled to {time_str}.")
+    return True
+
+
+async def toggle_job_enabled(job_id: str) -> bool | None:
+    """Toggle an alert job on or off.
+
+    Persists the new state to DB and pauses/resumes the live job.
+    Returns the new enabled state (True/False), or None if the job cannot be toggled
+    (i.e. always-on reports) or the scheduler is not running.
+    """
+    from src.services.config_service import SCHEDULE_JOBS, get_job_enabled, set_job_enabled
+
+    if job_id not in SCHEDULE_JOBS or scheduler is None:
+        return None
+
+    cfg = SCHEDULE_JOBS[job_id]
+    if not cfg.get("enabled_key"):
+        return None  # Always-on job — cannot be toggled
+
+    is_on = await get_job_enabled(job_id)
+    new_state = not is_on
+    await set_job_enabled(job_id, new_state)
+
+    if new_state:
+        scheduler.resume_job(job_id)
+        logger.info(f"Alert job '{job_id}' enabled — resumed.")
+    else:
+        scheduler.pause_job(job_id)
+        logger.info(f"Alert job '{job_id}' disabled — paused.")
+
+    return new_state
