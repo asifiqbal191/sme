@@ -1,26 +1,43 @@
 
 from sqlalchemy import select
+from sqlalchemy.exc import ProgrammingError
 from src.db.session import async_session
 from src.db.models import GlobalConfig
+import logging
+
+logger = logging.getLogger(__name__)
 
 async def get_config(key: str) -> str | None:
-    async with async_session() as session:
-        result = await session.execute(select(GlobalConfig).where(GlobalConfig.key == key))
-        config = result.scalar_one_or_none()
-        return config.value if config else None
+    try:
+        async with async_session() as session:
+            result = await session.execute(select(GlobalConfig).where(GlobalConfig.key == key))
+            config = result.scalar_one_or_none()
+            return config.value if config else None
+    except ProgrammingError:
+        # Table doesn't exist yet (fresh deploy) — return None and use defaults
+        logger.warning(f"get_config: 'global_config' table not ready yet, returning None for key='{key}'")
+        return None
+    except Exception as e:
+        logger.error(f"get_config error for key='{key}': {e}")
+        return None
 
 async def set_config(key: str, value: str):
-    async with async_session() as session:
-        result = await session.execute(select(GlobalConfig).where(GlobalConfig.key == key))
-        config = result.scalar_one_or_none()
+    try:
+        async with async_session() as session:
+            result = await session.execute(select(GlobalConfig).where(GlobalConfig.key == key))
+            config = result.scalar_one_or_none()
 
-        if config:
-            config.value = value
-        else:
-            new_config = GlobalConfig(key=key, value=value)
-            session.add(new_config)
+            if config:
+                config.value = value
+            else:
+                new_config = GlobalConfig(key=key, value=value)
+                session.add(new_config)
 
-        await session.commit()
+            await session.commit()
+    except ProgrammingError:
+        logger.warning(f"set_config: 'global_config' table not ready yet, skipping key='{key}'")
+    except Exception as e:
+        logger.error(f"set_config error for key='{key}': {e}")
 
 async def get_active_sheet_name() -> str | None:
     """Returns the spreadsheet name from DB, or None if not set."""
