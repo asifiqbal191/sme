@@ -41,7 +41,10 @@ async def lifespan(app: FastAPI):
             pass  # Column already exists, safe to ignore
         
     logger.info("Starting up Telegram Bots for all tenants...")
-    await bot_manager.start_all_tenant_bots()
+    try:
+        await bot_manager.start_all_tenant_bots()
+    except Exception as e:
+        logger.warning(f"Bot startup skipped due to an error: {e}. The app will continue without active bots.")
 
     # Start the automated report scheduler
     try:
