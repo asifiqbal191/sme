@@ -21,8 +21,8 @@ class Settings(BaseSettings):
 
     @property
     def report_chat_ids(self) -> List[str]:
-        """Returns all chat IDs that should receive scheduled reports (primary admin + extras)."""
-        ids = [self.TELEGRAM_CHAT_ID] if self.TELEGRAM_CHAT_ID else []
+        """Returns all chat IDs that should receive scheduled reports (extras only)."""
+        ids = []
         if self.TELEGRAM_REPORT_CHAT_IDS:
             extras = [cid.strip() for cid in self.TELEGRAM_REPORT_CHAT_IDS.split(",") if cid.strip()]
             for cid in extras:

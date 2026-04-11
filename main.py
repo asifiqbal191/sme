@@ -39,6 +39,10 @@ async def lifespan(app: FastAPI):
             logger.info("Migration: added 'created_by_id' column to orders table.")
         except Exception:
             pass  # Column already exists, safe to ignore
+    
+    # NEW: Ensure primary data is seeded
+    from src.db.seed import ensure_base_data
+    await ensure_base_data()
         
     logger.info("Starting up Telegram Bots for all tenants...")
     await bot_manager.start_all_tenant_bots()
