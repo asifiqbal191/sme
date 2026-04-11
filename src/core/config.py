@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     # Google Sheets
     GOOGLE_SHEET_NAME: str = "Orders Dashboard"
     GOOGLE_CREDENTIALS_FILE: str = "service_account.json"
-    GOOGLE_CREDENTIALS_JSON: Optional[str] = None # For Railway/Production
+    GSHEETS_CONFIG_JSON: Optional[str] = None # For Railway/Production
 
     DATABASE_URL: Optional[str] = None # Railway provides this
 

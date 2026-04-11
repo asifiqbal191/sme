@@ -25,14 +25,14 @@ def _get_gspread_client():
     ]
     
     # 1. Try Loading from JSON string (Railway/Production priority)
-    if settings.GOOGLE_CREDENTIALS_JSON:
+    if settings.GSHEETS_CONFIG_JSON:
         import json
         try:
-            info = json.loads(settings.GOOGLE_CREDENTIALS_JSON)
+            info = json.loads(settings.GSHEETS_CONFIG_JSON)
             creds = Credentials.from_service_account_info(info, scopes=scopes)
-            logger.info("Authorized Google Sheets using GOOGLE_CREDENTIALS_JSON.")
+            logger.info("Authorized Google Sheets using GSHEETS_CONFIG_JSON.")
         except Exception as e:
-            logger.error(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
+            logger.error(f"Failed to parse GSHEETS_CONFIG_JSON: {e}")
             raise e
     else:
         # 2. Fallback to File (Local Development)
