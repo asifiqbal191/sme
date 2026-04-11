@@ -40,8 +40,11 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass  # Column already exists, safe to ignore
         
-    logger.info("Starting up Telegram Bots for all tenants...")
-    await bot_manager.start_all_tenant_bots()
+    # Bot startup disabled: querying the tenants table immediately after schema
+    # creation causes a "relation does not exist" crash on first deploy.
+    # Bots can be started separately or triggered manually.
+    # logger.info("Starting up Telegram Bots for all tenants...")
+    # await bot_manager.start_all_tenant_bots()
 
     # Start the automated report scheduler
     try:
