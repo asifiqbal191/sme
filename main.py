@@ -25,25 +25,34 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     # Initialize DB
     logger.info("Initializing database schema...")
+    # Step 1: Create all tables in a clean, isolated transaction
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Migration: add role column to invites if it doesn't exist (SQLite doesn't auto-add columns)
+    logger.info("Database schema created.")
+
+    # Step 2: Run migrations in separate transactions using IF NOT EXISTS
+    # This prevents any single failure from aborting the whole startup
+    async with engine.begin() as conn:
         try:
-            await conn.execute(text("ALTER TABLE invites ADD COLUMN role VARCHAR DEFAULT 'MODERATOR'"))
-            logger.info("Migration: added 'role' column to invites table.")
-        except Exception:
-            pass
-            
+            await conn.execute(text("ALTER TABLE invites ADD COLUMN IF NOT EXISTS role VARCHAR DEFAULT 'MODERATOR'"))
+            logger.info("Migration: 'role' column ensured on invites table.")
+        except Exception as e:
+            logger.warning(f"Migration skipped (invites.role): {e}")
+
+    async with engine.begin() as conn:
         try:
-            await conn.execute(text("ALTER TABLE orders ADD COLUMN created_by_id VARCHAR"))
-            logger.info("Migration: added 'created_by_id' column to orders table.")
-        except Exception:
-            pass  # Column already exists, safe to ignore
-    
-    # NEW: Ensure primary data is seeded
-    from src.db.seed import ensure_base_data
-    await ensure_base_data()
-        
+            await conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_by_id VARCHAR"))
+            logger.info("Migration: 'created_by_id' column ensured on orders table.")
+        except Exception as e:
+            logger.warning(f"Migration skipped (orders.created_by_id): {e}")
+
+    # Step 3: Seed base data (creates primary tenant + superadmin if missing)
+    try:
+        from src.db.seed import ensure_base_data
+        await ensure_base_data()
+    except Exception as e:
+        logger.error(f"Auto-seeding failed (non-fatal): {e}", exc_info=True)
+
     logger.info("Starting up Telegram Bots for all tenants...")
     await bot_manager.start_all_tenant_bots()
 
