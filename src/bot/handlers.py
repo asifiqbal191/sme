@@ -5,15 +5,14 @@ from telegram.ext import ContextTypes
 from src.core.config import settings
 from src.core.context import get_tenant_id
 from src.db.session import async_session
-from src.services import analytics, sheets
+from src.services import analytics
 from src.services.parser import parse_order_message
 from src.services.order_service import process_telegram_order
 from src.services import tenant_service
 from sqlalchemy import select
-from src.db.models import PlatformEnum, Order, Payment, PaymentStatusEnum
+from src.db.models import PlatformEnum, Order, Payment, PaymentStatusEnum, Product
 from src.services import config_service
 from src.services.config_service import SCHEDULE_JOBS
-from src.services.sheets import check_google_sheets_connection
 from src.bot.bot_manager import bot_manager
 
 from src.auth.roles import (
@@ -77,12 +76,6 @@ async def _complete_invite_join(update: Update, code: str) -> None:
         welcome_msg = (
             f"✅ **Welcome {full_name}!** You have been added as an Admin.\n\n"
             "You now have full access to this client's workspace.\n\n"
-            "**What you can do:**\n"
-            "• View daily, weekly and monthly sales reports\n"
-            "• Monitor top products and revenue breakdown\n"
-            "• Check pending orders and stock alerts\n"
-            "• Manage moderators (invite, ban, unban)\n"
-            "• Connect and manage Google Sheets\n\n"
             "Tap the button below to open your dashboard."
         )
         await update.effective_message.reply_text("📌 Quick access pinned below.", reply_markup=get_persistent_keyboard())
@@ -99,8 +92,9 @@ async def _complete_invite_join(update: Update, code: str) -> None:
             "`Product: Exact Product Name`\n"
             "`Qty: 1`\n"
             "`Price: 500`\n"
-            "`Phone: 017XXXXXXXX`\n\n"
-            "I will save it and automatically update the Google Sheets database!"
+            "`Phone: 017XXXXXXXX`\n"
+            "`Status: pending or paid`\n\n"
+            "I will save it in the database!"
         )
         await update.effective_message.reply_text("📌 Quick access pinned below.", reply_markup=get_moderator_persistent_keyboard())
         await update.effective_message.reply_text(welcome_msg, parse_mode="Markdown")
@@ -135,10 +129,12 @@ def get_superadmin_menu_keyboard():
 
 
 def get_main_menu_keyboard():
+    tid = get_tenant_id()
+    dashboard_url = f"{settings.DASHBOARD_URL}?tenant_id={tid}" if tid else settings.DASHBOARD_URL
     keyboard = [
         [
             InlineKeyboardButton("📊 Today's Sales", callback_data="cmd_today_all"),
-            InlineKeyboardButton("🌍 Web Dashboard", url=settings.DASHBOARD_URL)
+            InlineKeyboardButton("🌍 Web Dashboard", url=dashboard_url)
         ],
         [
             InlineKeyboardButton("📅 Weekly", callback_data="cmd_weekly"),
@@ -159,7 +155,7 @@ def get_main_menu_keyboard():
             InlineKeyboardButton("👥 Team Stats",     callback_data="cmd_team_stats")
         ],
         [
-            InlineKeyboardButton("📊 Google Sheet", callback_data="cmd_check_sheets"),
+            InlineKeyboardButton("📥 Export Excel", callback_data="cmd_export_excel"),
             InlineKeyboardButton("⚙️ Settings", callback_data="cmd_settings")
         ]
     ]
@@ -182,7 +178,6 @@ def get_settings_keyboard():
         [InlineKeyboardButton("🎟️ Generate Invite Link", callback_data="cmd_generate_invite")],
         [InlineKeyboardButton("👥 List Moderators", callback_data="cmd_list_mods")],
         [InlineKeyboardButton("👑 Admin Management", callback_data="cmd_admin_mgmt")],
-        [InlineKeyboardButton("📊 Manage Spreadsheet", callback_data="cmd_manage_sheets")],
         [InlineKeyboardButton("🏠 Back to Main Menu", callback_data="cmd_main_menu")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -454,8 +449,9 @@ async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "`Product: Exact Product Name`\n"
             "`Qty: 1`\n"
             "`Price: 500`\n"
-            "`Phone: 017XXXXXXXX`\n\n"
-            "I will save it and automatically update the Google Sheets database!"
+            "`Phone: 017XXXXXXXX`\n"
+            "`Status: pending or paid`\n\n"
+            "I will save it in the database!"
         )
         # Show persistent keyboard for moderator
         await update.effective_message.reply_text("📌 Quick access pinned below.", reply_markup=get_moderator_persistent_keyboard())
@@ -1025,80 +1021,11 @@ async def markpaid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         session.add(Payment(sender_phone="manual", amount=float(order.price), matched_order_id=order.id))
         await session.commit()
 
-        import asyncio
-        asyncio.create_task(sheets.update_payment_status_in_sheets(order_id, "PAID"))
-
     await update.effective_message.reply_text(
         f"✅ *Order Marked as Paid*\n\nID: `{order_id}`\nProduct: {order.product_name}\nAmount: ৳{order.price}",
         parse_mode="Markdown",
         reply_markup=get_main_menu_keyboard()
     )
-
-async def _send_sheets_check(update: Update, edit: bool = False):
-    sheet_name = await config_service.get_active_sheet_name()
-    sheet_url = await config_service.get_active_sheet_url()
-    
-    if not sheet_name:
-        msg = (
-            "❌ <b>No Spreadsheet Linked</b>\n\n"
-            "To sync your orders to Google Sheets, you must first connect a spreadsheet in the settings."
-        )
-        keyboard = [[InlineKeyboardButton("⚙️ Go to Settings", callback_data="cmd_settings")]]
-        keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_main_menu")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        if edit and update.callback_query:
-            await update.callback_query.edit_message_text(msg, parse_mode="HTML", reply_markup=reply_markup)
-        else:
-            await update.effective_message.reply_html(msg, reply_markup=reply_markup)
-        return
-
-    # If we already have the URL in DB, show it instantly
-    if sheet_url:
-        msg = (
-            f"✅ <b>Connected to Google Sheets</b>\n"
-            f"Sheet Name: <code>{sheet_name}</code>\n\n"
-            f"Click the button below to open your spreadsheet."
-        )
-        keyboard = [[InlineKeyboardButton("📄 Open Sheet", url=sheet_url)]]
-        keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_main_menu")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        if edit and update.callback_query:
-            await update.callback_query.edit_message_text(msg, parse_mode="HTML", reply_markup=reply_markup)
-        else:
-            await update.effective_message.reply_html(msg, reply_markup=reply_markup)
-        return
-
-    # Fallback to full check if URL is missing
-    result = await sheets.check_google_sheets_connection(sheet_name)
-    if result["success"]:
-        final_url = result["url"]
-        await config_service.set_active_sheet_url(final_url)
-        msg = (
-            f"✅ <b>Connected to Google Sheets</b>\n"
-            f"Sheet Name: <code>{sheet_name}</code>\n\n"
-            "Click the button below to open your spreadsheet.\n\n"
-            "<i>💡 Tip: Make sure you've also shared this sheet with your personal Google email for access.</i>"
-        )
-        keyboard = [[InlineKeyboardButton("📄 Open Sheet", url=final_url)]]
-        keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_main_menu")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        if edit and update.callback_query:
-            await update.callback_query.edit_message_text(msg, parse_mode="HTML", reply_markup=reply_markup)
-        else:
-            await update.effective_message.reply_html(msg, reply_markup=reply_markup)
-    else:
-        msg = f"❌ <b>Link Broken</b>: {result['error']}\n\nPlease check the name in <b>Settings</b>."
-        keyboard = [[InlineKeyboardButton("⚙️ Manage Spreadsheet", callback_data="cmd_manage_sheets")]]
-        keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_main_menu")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        if edit and update.callback_query:
-            await update.callback_query.edit_message_text(msg, parse_mode="HTML", reply_markup=reply_markup)
-        else:
-            await update.effective_message.reply_html(msg, reply_markup=reply_markup)
-
-@require_admin
-async def check_sheets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _send_sheets_check(update, edit=False)
 
 @require_admin
 async def forcereport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1137,10 +1064,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     admin_only_prefixes = [
         "cmd_today_", "cmd_orders_", "cmd_top", "cmd_pending",
         "cmd_weekly", "cmd_monthly", "cmd_growth", "cmd_alerts",
-        "cmd_check_sheets", "cmd_settings", "cmd_generate_invite",
+        "cmd_settings", "cmd_generate_invite",
         "cmd_gen_invite_", "cmd_list_mods", "cmd_manage_bans",
         "cmd_prompt_", "cmd_admin_mgmt", "cmd_gen_admin_invite",
-        "cmd_remove_admin_", "cmd_manage_sheets",
+        "cmd_remove_admin_", "cmd_export_excel",
         "cmd_sched", "cmd_sa_",
     ]
     
@@ -1161,7 +1088,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         msg = (
             "➕ *Add a New Client*\n\n"
             "This wizard will guide you through creating a new client.\n\n"
-            "*Step 1 of 3:*\n"
+            "*Step 1 of 2:*\n"
             "Please send the *Name* of the new client (e.g. `Lux Corporation`):"
         )
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]])
@@ -1169,8 +1096,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data == "cmd_sa_confirm_client":
         client_name = context.user_data.get("sa_new_client_name")
         bot_token = context.user_data.get("sa_new_client_token")
-        sheet_name = context.user_data.get("sa_new_client_sheet")
-        
+
         if not client_name or not bot_token:
             await query.answer("Missing data. Please try adding again.", show_alert=True)
             return
@@ -1178,7 +1104,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text("⏳ Creating workspace and starting bot. Please wait...", parse_mode="Markdown")
         
         try:
-            tenant = await tenant_service.create_tenant(client_name, bot_token, sheet_name)
+            tenant = await tenant_service.create_tenant(client_name, bot_token)
         except ValueError as exc:
             await query.edit_message_text(f"❌ {exc}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="cmd_main_menu")]]))
             return
@@ -1197,8 +1123,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Bot: {bot_line}",
             status_line,
         ]
-        if tenant.google_sheet_name:
-            lines.append(f"Sheet: `{tenant.google_sheet_name}`")
         if admin_code:
             lines.append("")
             lines.append("*Client Admin Access*")
@@ -1246,8 +1170,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await growth_command(update, context)
     elif query.data == "cmd_alerts":
         await alerts_command(update, context)
-    elif query.data == "cmd_check_sheets":
-        await _send_sheets_check(update, edit=True)
+    elif query.data == "cmd_export_excel":
+        await query.answer("⏳ Generating Excel file...")
+        await export_command(update, context)
+
     elif query.data == "cmd_settings":
         await query.edit_message_text("⚙️ **Settings & Management**\n\nChoose an option:", parse_mode="Markdown", reply_markup=get_settings_keyboard())
 
@@ -1433,7 +1359,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data == "cmd_main_menu":
         context.user_data.pop("awaiting_sa_client_name", None)
         context.user_data.pop("awaiting_sa_bot_token", None)
-        context.user_data.pop("awaiting_sa_sheet_id", None)
+        context.user_data.pop("awaiting_sa_bot_token", None)
         
         user_id = str(query.from_user.id)
         role = await get_user_role(user_id)
@@ -1511,59 +1437,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             await query.answer("❌ Could not remove admin.", show_alert=True)
 
-    elif query.data == "cmd_manage_sheets":
-        sheet_name = await config_service.get_active_sheet_name()
-        status = f"🟢 Connected to: `{sheet_name}`" if sheet_name else "🔴 *Not Connected*"
-        
-        # Get service account email from settings/file
-        import json
-        try:
-            with open("service_account.json", "r") as f:
-                creds = json.load(f)
-                email = creds.get("client_email", "Not Found")
-        except:
-            email = "service_account.json not found"
-
-        text = (
-            "📊 **Manage Spreadsheet Connection**\n\n"
-            f"**Status:** {status}\n\n"
-            "📌 **How to connect a new Spreadsheet:**\n"
-            "1️⃣ **Create:** Open Google Sheets and create a new blank spreadsheet.\n"
-            "2️⃣ **Share:** Click the blue *Share* button in the top right corner.\n"
-            f"3️⃣ **Add Bot:** Paste this exact email address and give it **Editor** access:\n`{email}`\n"
-            "4️⃣ **Link:** Tap the *🔗 Set/Change Connection* button below.\n"
-            "5️⃣ **Submit:** The bot will ask for the URL. Simply copy the link to your spreadsheet from your browser and send it to the bot.\n"
-        )
-        buttons = [
-            [InlineKeyboardButton("🔗 Set/Change Connection", callback_data="cmd_prompt_sheet_name")]
-        ]
-        if sheet_name:
-            buttons.append([InlineKeyboardButton("❌ Disconnect Spreadsheet", callback_data="cmd_disconnect_sheets")])
-        buttons.append([InlineKeyboardButton("🔙 Back to Settings", callback_data="cmd_settings")])
-        
-        keyboard = InlineKeyboardMarkup(buttons)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
-
-    elif query.data == "cmd_disconnect_sheets":
-        await config_service.set_active_sheet_name(None)
-        await config_service.set_active_sheet_url(None)
-        await query.edit_message_text(
-            "✅ **Spreadsheet Disconnected**\n\nThe bot will no longer sync orders to Google Sheets.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Settings", callback_data="cmd_settings")]])
-        )
-
-    elif query.data == "cmd_prompt_sheet_name":
-        context.user_data["awaiting_sheet_name"] = True
-        text = (
-            "📝 **Send the Google Spreadsheet URL**\n\n"
-            "Please paste the full link (URL) of your Google Spreadsheet here. "
-            "You can also send just the Spreadsheet ID if you prefer.\n\n"
-            "*(⚠️ Reminder: Before linking, please make sure you completed step 3 and added the bot's email to your spreadsheet's Share settings!)*"
-        )
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_manage_sheets")]])
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
-
     elif query.data.startswith("cmd_markpaid_"):
         order_id = query.data.replace("cmd_markpaid_", "")
         price = None
@@ -1591,9 +1464,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             session.add(Payment(sender_phone="manual", amount=price, matched_order_id=order.id))
             await session.commit()
             await session.refresh(order)
-
-            import asyncio
-            asyncio.create_task(sheets.update_payment_status_in_sheets(order_id, "PAID"))
 
             card = _order_card_text(order)
 
@@ -1652,8 +1522,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await session.refresh(order)
                 if order:
                     card = _order_card_text(order)
-                    import asyncio
-                    asyncio.create_task(sheets.update_payment_status_in_sheets(order_id, "PAID"))
                 else:
                     card = f"Order `{order_id}` not found."
             await query.edit_message_text(
@@ -1758,10 +1626,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             order.payment_status = PaymentStatusEnum.CANCELLED
             await session.commit()
-            
-        import asyncio as _asyncio
-        _asyncio.create_task(sheets.update_payment_status_in_sheets(order_id, "CANCELLED"))
-        
+
         await query.edit_message_text(
             f"🗑️ Order `{order_id}` has been cancelled and stock returned.",
             parse_mode="Markdown"
@@ -1864,8 +1729,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["awaiting_sa_bot_token"] = True
         await update.effective_message.reply_text(
             "✅ Name saved.\n\n"
-            "*Step 2 of 3:*\n"
-            "Please send the **Telegram Bot Token** for this new client\n_(get this from @BotFather)_:", 
+            "*Step 2 of 2:*\n"
+            "Please send the **Telegram Bot Token** for this new client\n_(get this from @BotFather)_:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]])
         )
@@ -1874,33 +1739,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if context.user_data.get("awaiting_sa_bot_token"):
         context.user_data["sa_new_client_token"] = text.strip()
         context.user_data["awaiting_sa_bot_token"] = False
-        context.user_data["awaiting_sa_sheet_id"] = True
-        await update.effective_message.reply_text(
-            "✅ Token saved.\n\n"
-            "*Step 3 of 3:*\n"
-            "Please send the **Google Sheet Name or ID** you want to link.\n\n"
-            "_(If you don't want to link one right now, just type `skip`)_", 
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]])
-        )
-        return
 
-    if context.user_data.get("awaiting_sa_sheet_id"):
-        sheet_input = text.strip()
-        if sheet_input.lower() == "skip":
-            sheet_input = None
-        context.user_data["sa_new_client_sheet"] = sheet_input
-        context.user_data["awaiting_sa_sheet_id"] = False
-        
         name = context.user_data["sa_new_client_name"]
         token = context.user_data["sa_new_client_token"]
-        sheet = context.user_data["sa_new_client_sheet"]
-        
+
         msg = (
             "📝 **Confirm New Client Details**\n\n"
             f"**Name:** {name}\n"
-            f"**Token:** `{token}`\n"
-            f"**Sheet:** {sheet or 'None'}\n\n"
+            f"**Token:** `{token}`\n\n"
             "Does everything look correct?"
         )
         keyboard = InlineKeyboardMarkup([
@@ -1988,9 +1834,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     return
                 try:
                     if field == "product":
-                        order.product_name = new_val.title()
+                        old_name = order.product_name
+                        new_name = new_val.title()
+                        if old_name != new_name:
+                            # Return stock to the old product
+                            old_prod = (await session.execute(
+                                select(Product).where(Product.name == old_name)
+                            )).scalar_one_or_none()
+                            if old_prod:
+                                old_prod.current_stock += order.quantity
+
+                            # Deduct stock from the new product (if tracked)
+                            new_prod = (await session.execute(
+                                select(Product).where(Product.name == new_name)
+                            )).scalar_one_or_none()
+                            if new_prod:
+                                new_prod.current_stock = max(0, new_prod.current_stock - order.quantity)
+                            else:
+                                session.add(Product(name=new_name, current_stock=0))
+
+                        order.product_name = new_name
+
                     elif field == "qty":
-                        order.quantity = int(new_val)
+                        old_qty = order.quantity
+                        new_qty = int(new_val)
+                        if new_qty < 1:
+                            raise ValueError("Quantity must be at least 1.")
+                        if old_qty != new_qty:
+                            # Adjust stock: positive diff = stock goes up (reduced qty), negative = goes down
+                            qty_diff = old_qty - new_qty
+                            prod = (await session.execute(
+                                select(Product).where(Product.name == order.product_name)
+                            )).scalar_one_or_none()
+                            if prod:
+                                prod.current_stock = max(0, prod.current_stock + qty_diff)
+                        order.quantity = new_qty
+
                     elif field == "price":
                         order.price = float(new_val)
                     elif field == "phone":
@@ -2001,16 +1880,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await session.commit()
                     await session.refresh(order)
                     card = _order_card_text(order)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as exc:
                     await update.effective_message.reply_text(
-                        f"❌ Invalid value `{new_val}` for *{field}*. Please try again.",
+                        f"❌ Invalid value `{new_val}` for *{field}*. {exc}",
                         parse_mode="Markdown"
                     )
                     return
-
-            # Sync the changed field to Google Sheets in the background
-            import asyncio as _asyncio
-            _asyncio.create_task(sheets.update_order_field_in_sheets(order_id, field, new_val))
 
             await update.effective_message.reply_text(
                 f"✅ *Order updated!*\n\n{card}",
@@ -2065,34 +1940,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     parse_mode="Markdown",
                     reply_markup=get_main_menu_keyboard()
                 )
-                return
-
-            # Check if we are waiting for a spreadsheet name
-            if context.user_data.get("awaiting_sheet_name"):
-                input_text = text.strip()
-                import re
-                
-                # Extract ID if a full URL is provided
-                match = re.search(r"/d/([a-zA-Z0-9-_]+)", input_text)
-                sheet_id = match.group(1) if match else input_text
-                
-                await update.effective_message.reply_text(f"⏳ Verifying connection to ID: `{sheet_id}`...", parse_mode="Markdown")
-
-                result = await check_google_sheets_connection(sheet_id)
-                if result["success"]:
-                    await config_service.set_active_sheet_name(sheet_id)
-                    await config_service.set_active_sheet_url(result["url"])
-                    context.user_data["awaiting_sheet_name"] = False
-                    msg = f"✅ **Success!** Linked to Spreadsheet ID: `{sheet_id}`\n\nAll new orders will now be synced to this spreadsheet."
-                    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Open Main Menu", callback_data="cmd_main_menu")]])
-                    await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=keyboard)
-                else:
-                    msg = f"❌ **Connection Failed**\n\nError: {result['error']}\n\nPlease make sure the ID/URL is correct and the sheet is shared with the service account email."
-                    keyboard = InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Try Again", callback_data="cmd_prompt_sheet_name")],
-                        [InlineKeyboardButton("❌ Cancel", callback_data="cmd_manage_sheets")]
-                    ])
-                    await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=keyboard)
                 return
 
             # --- Handle awaiting schedule time input ---
@@ -2280,8 +2127,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
     async with async_session() as session:
-        new_order = await process_telegram_order(parsed, update.effective_message.message_id, session, platform=final_platform, created_by_id=user_id)
-        
+        new_order, error_msg = await process_telegram_order(parsed, update.effective_message.message_id, session, platform=final_platform, created_by_id=user_id)
+
+        if error_msg:
+            await update.effective_message.reply_text(error_msg, parse_mode="Markdown")
+            return
+
         if new_order:
             status_icon = "✅ PAID" if new_order.payment_status.value == "PAID" else "⏳ PENDING"
             confirm_msg = (
@@ -2304,3 +2155,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
         else:
             await update.effective_message.reply_text("❌ Failed to process order!")
+
+
+@require_admin
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate and send an Excel export of all orders."""
+    import io
+    from src.services.excel_export import generate_orders_excel
+
+    target = update.effective_message
+    if update.callback_query:
+        target = update.callback_query.message
+
+    await target.reply_text("⏳ Generating Excel file, please wait...")
+
+    try:
+        async with async_session() as session:
+            excel_bytes = await generate_orders_excel(session)
+
+        file_obj = io.BytesIO(excel_bytes)
+        file_obj.name = "orders_export.xlsx"
+        await target.reply_document(
+            document=file_obj,
+            filename="orders_export.xlsx",
+            caption="📥 *Orders Export*\n\nAll orders exported successfully.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_main_menu")]])
+        )
+    except Exception as e:
+        logger.error(f"Excel export failed: {e}")
+        await target.reply_text("❌ Failed to generate export. Please try again.")

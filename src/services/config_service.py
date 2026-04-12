@@ -39,21 +39,6 @@ async def set_config(key: str, value: str):
     except Exception as e:
         logger.error(f"set_config error for key='{key}': {e}")
 
-async def get_active_sheet_name() -> str | None:
-    """Returns the spreadsheet name from DB, or None if not set."""
-    return await get_config("google_sheet_name")
-
-async def set_active_sheet_name(name: str):
-    await set_config("google_sheet_name", name)
-
-async def get_active_sheet_url() -> str | None:
-    """Returns the spreadsheet URL from DB, or None if not set."""
-    return await get_config("google_sheet_url")
-
-async def set_active_sheet_url(url: str):
-    await set_config("google_sheet_url", url)
-
-
 # ---------------------------------------------------------------------------
 # Schedule Job Configuration
 # ---------------------------------------------------------------------------

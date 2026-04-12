@@ -50,8 +50,14 @@ async def get_user_role(telegram_id: str) -> RoleEnum | None:
     if superadmin_role is not None:
         return superadmin_role
 
+    tid = normalize_tenant_id(get_tenant_id())
     async with async_session() as session:
-        result = await session.execute(select(User).where(User.telegram_id == telegram_id))
+        # Filter by both telegram_id AND tenant_id to support multi-tenant access
+        query = select(User).where(User.telegram_id == telegram_id)
+        if tid:
+            query = query.where(User.tenant_id == tid)
+            
+        result = await session.execute(query)
         user = result.scalar_one_or_none()
 
         if user and user.is_banned:
@@ -89,6 +95,7 @@ def require_admin(func):
             return
         return await func(update, context, *args, **kwargs)
     return wrapper
+
 
 def require_moderator_or_admin(func):
     @wraps(func)
@@ -166,11 +173,16 @@ async def redeem_invite_code(telegram_id: str, full_name: str, code: str) -> boo
         if not invite:
             return "Invalid or already used invite code."
 
-        # Check if user already exists
-        user_result = await session.execute(select(User).where(User.telegram_id == telegram_id))
+        # Check if user already exists IN THIS TENANT
+        user_result = await session.execute(
+            select(User).where(
+                User.telegram_id == telegram_id,
+                User.tenant_id == invite.tenant_id
+            )
+        )
         user = user_result.scalar_one_or_none()
         if user:
-            return "You are already registered."
+            return "You are already registered for this client."
 
         # For admin invites, enforce max 1 tenant admin
         if invite.role == RoleEnum.ADMIN:

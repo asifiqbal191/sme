@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, Integer, Numeric, DateTime, Enum as SAEnum, Boolean, JSON, Text
+from sqlalchemy import String, Integer, Numeric, DateTime, Enum as SAEnum, Boolean
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from typing import Optional
 import enum
@@ -31,10 +31,6 @@ class RoleEnum(str, enum.Enum):
     ADMIN = "ADMIN"
     MODERATOR = "MODERATOR"
 
-class SyncStatusEnum(str, enum.Enum):
-    PENDING = "PENDING"
-    FAILED = "FAILED"
-    COMPLETED = "COMPLETED"
 
 class Tenant(Base):
     __tablename__ = "tenants"
@@ -112,16 +108,4 @@ class GlobalConfig(Base):
     value: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_local, onupdate=now_local)
 
-class SheetSyncTask(Base):
-    __tablename__ = "sheet_sync_queue"
-    
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    tenant_id: Mapped[Optional[uuid.UUID]] = mapped_column(index=True, nullable=True)
-    action: Mapped[str] = mapped_column(String(50)) # e.g., 'APPEND_ORDER', 'UPDATE_FIELD', 'UPDATE_STATUS'
-    payload: Mapped[dict] = mapped_column(JSON) # JSON data for the action
-    status: Mapped[SyncStatusEnum] = mapped_column(SAEnum(SyncStatusEnum), default=SyncStatusEnum.PENDING, index=True)
-    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    retries: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_local)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_local, onupdate=now_local)
 
