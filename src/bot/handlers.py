@@ -21,6 +21,7 @@ from src.auth.roles import (
     require_admin,
     require_superadmin,
     require_moderator_or_admin,
+    require_spreadsheet,
     generate_invite_code,
     generate_admin_invite_code,
     redeem_invite_code,
@@ -60,6 +61,12 @@ async def _send_admin_home(update: Update, role: RoleEnum) -> None:
             parse_mode="Markdown",
         )
     else:
+        sheet_name = await config_service.get_active_sheet_name()
+        if not sheet_name:
+            # Re-use the manage_sheets logic but as a welcome screen
+            await _send_spreadsheet_setup_needed(update, role)
+            return
+
         await update.effective_message.reply_text("📌 Quick access pinned below.", reply_markup=get_persistent_keyboard())
         text = "Welcome to the Multi-Platform Order Tracking Agent 🤖\n\nPlease select an option below:"
         await update.effective_message.reply_text(
@@ -68,21 +75,66 @@ async def _send_admin_home(update: Update, role: RoleEnum) -> None:
             parse_mode="Markdown",
         )
 
+async def _send_spreadsheet_setup_needed(update: Update, role: RoleEnum) -> None:
+    """Shows the spreadsheet connection requirement screen with instructions."""
+    email = await _get_service_account_email()
+    
+    text = (
+        "👋 **Welcome! Let's get started...**\n\n"
+        "To use this bot, you first need to link a **Google Spreadsheet**. "
+        "This ensures all your orders are safely backed up in real-time.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📍 **Quick Setup Guide:**\n"
+        "1️⃣ Open Google Sheets and create a blank spreadsheet.\n"
+        "2️⃣ Click the blue **Share** button (top-right).\n"
+        "3️⃣ Add this bot's email and give it **Editor** access:\n"
+        f"`{email}`\n"
+        "4️⃣ Copy the spreadsheet URL and paste it here.\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Tap the button below to submit your link:"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Set/Change Connection", callback_data="cmd_prompt_sheet_name")],
+        [InlineKeyboardButton("⚙️ Open Settings", callback_data="cmd_settings")]
+    ])
+    
+    if update.effective_message:
+        await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+async def _get_service_account_email() -> str:
+    """Helper to fetch the service account email from config or file."""
+    import json as _json
+    try:
+        if settings.GSHEETS_CONFIG_JSON:
+            # Handle potential double-quotes from env vars
+            raw_json = settings.GSHEETS_CONFIG_JSON.strip()
+            if raw_json.startswith('"') and raw_json.endswith('"'):
+                raw_json = raw_json[1:-1].replace('\\"', '"')
+            _creds = _json.loads(raw_json)
+        else:
+            with open("service_account.json", "r") as _f:
+                _creds = _json.load(_f)
+        return _creds.get("client_email", "Not Found in JSON")
+    except Exception as e:
+        logger.error(f"Error reading service account email: {e}")
+        return "Not Found (Check GSHEETS_CONFIG_JSON)"
+
 async def _complete_invite_join(update: Update, code: str) -> None:
     user_id = str(update.effective_user.id)
     full_name = update.effective_user.full_name or "Moderator"
     result = await redeem_invite_code(user_id, full_name, code)
 
     if result == RoleEnum.ADMIN:
+        sheet_name = await config_service.get_active_sheet_name()
+        if not sheet_name:
+            await _send_spreadsheet_setup_needed(update, RoleEnum.ADMIN)
+            return
+
         welcome_msg = (
             f"✅ **Welcome {full_name}!** You have been added as an Admin.\n\n"
             "You now have full access to this client's workspace.\n\n"
-            "**What you can do:**\n"
-            "• View daily, weekly and monthly sales reports\n"
-            "• Monitor top products and revenue breakdown\n"
-            "• Check pending orders and stock alerts\n"
-            "• Manage moderators (invite, ban, unban)\n"
-            "• Connect and manage Google Sheets\n\n"
             "Tap the button below to open your dashboard."
         )
         await update.effective_message.reply_text("📌 Quick access pinned below.", reply_markup=get_persistent_keyboard())
@@ -692,10 +744,12 @@ async def _send_recent_orders(update: Update, platform: PlatformEnum = None, edi
         await update.effective_message.reply_markdown(text, reply_markup=reply_markup)
 
 @require_admin
+@require_spreadsheet
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_today_sales(update, platform=None)
 
 @require_admin
+@require_spreadsheet
 async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_recent_orders(update, platform=None)
 
@@ -730,6 +784,7 @@ def _mod_order_action_keyboard(order_id: str) -> InlineKeyboardMarkup:
     ])
 
 @require_admin
+@require_spreadsheet
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Search orders by product name, phone, or order ID. Usage: /search <query>"""
     if not context.args:
@@ -764,6 +819,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 @require_admin
+@require_spreadsheet
 async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with async_session() as session:
         top_product = await analytics.get_weekly_top_product(session)
@@ -774,6 +830,7 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.effective_message.reply_text("No sales recorded in the last 7 days.", reply_markup=get_main_menu_keyboard())
 
 @require_admin
+@require_spreadsheet
 async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with async_session() as session:
         stats = await analytics.get_weekly_sales(session)
@@ -788,6 +845,7 @@ async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.effective_message.reply_markdown(msg, reply_markup=get_main_menu_keyboard())
 
 @require_admin
+@require_spreadsheet
 async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with async_session() as session:
         stats = await analytics.get_monthly_sales(session)
@@ -802,6 +860,7 @@ async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.effective_message.reply_markdown(msg, reply_markup=get_main_menu_keyboard())
 
 @require_admin
+@require_spreadsheet
 async def growth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with async_session() as session:
         predictions = await analytics.get_stock_predictions(session)
@@ -851,6 +910,7 @@ async def moderator_stats_command(update: Update, context: ContextTypes.DEFAULT_
 
 
 @require_admin
+@require_spreadsheet
 async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with async_session() as session:
         predictions = await analytics.get_stock_predictions(session)
@@ -867,6 +927,7 @@ async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.effective_message.reply_markdown(msg, reply_markup=get_main_menu_keyboard())
 
 @require_admin
+@require_spreadsheet
 async def stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show all products with current stock levels, sales velocity, and days remaining."""
     async with async_session() as session:
@@ -943,6 +1004,7 @@ async def team_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 @require_admin
+@require_spreadsheet
 async def setstock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Set stock for a product. Usage: /setstock <quantity> <product name>"""
     if not context.args or len(context.args) < 2:
@@ -978,6 +1040,7 @@ async def setstock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 @require_admin
+@require_spreadsheet
 async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with async_session() as session:
         orders = await analytics.get_pending_orders(session, limit=5)
@@ -1153,6 +1216,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if is_admin_cmd and role not in ADMIN_ROLES:
         await query.answer("⛔ Access Denied. Admin privileges required.", show_alert=True)
         return
+
+    # Check for spreadsheet requirement on specific feature buttons
+    feature_commands = [
+        "cmd_today_", "cmd_orders_", "cmd_top", "cmd_pending",
+        "cmd_weekly", "cmd_monthly", "cmd_growth", "cmd_alerts",
+        "cmd_stock", "cmd_team_stats", "cmd_mod_stock", "cmd_my_stats"
+    ]
+    if any(query.data.startswith(c) for c in feature_commands):
+        sheet_name = await config_service.get_active_sheet_name()
+        if not sheet_name:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            if role in ADMIN_ROLES:
+                msg = (
+                    "📊 **Spreadsheet Required**\n\n"
+                    "Before you can use any tracking features, you must connect a Google Spreadsheet.\n\n"
+                    "Tap the button below to start the connection guide:"
+                )
+                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Connect Spreadsheet", callback_data="cmd_manage_sheets")]])
+            else:
+                msg = (
+                    "⚠️ **System Not Ready**\n\n"
+                    "Your Admin has not connected a Google Spreadsheet yet. "
+                    "Features will be enabled once the setup is complete."
+                )
+                keyboard = None
+            
+            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
+            return
 
     if query.data == "cmd_sa_list_clients":
         await list_clients_command(update, context)
@@ -1444,6 +1535,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 reply_markup=get_superadmin_menu_keyboard()
             )
         elif role in ADMIN_ROLES:
+            sheet_name = await config_service.get_active_sheet_name()
+            if not sheet_name:
+                await _send_spreadsheet_setup_needed(update, role)
+                return
             await query.edit_message_text("Welcome to the Multi-Platform Order Tracking Agent 🤖\n\nPlease select an option below:", reply_markup=get_main_menu_keyboard())
         else:
             await query.edit_message_text("Welcome back! Use the keyboard below to check your stats or just send an #ORDER.")
@@ -1514,15 +1609,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data == "cmd_manage_sheets":
         sheet_name = await config_service.get_active_sheet_name()
         status = f"🟢 Connected to: `{sheet_name}`" if sheet_name else "🔴 *Not Connected*"
-        
-        # Get service account email from settings/file
-        import json
-        try:
-            with open("service_account.json", "r") as f:
-                creds = json.load(f)
-                email = creds.get("client_email", "Not Found")
-        except:
-            email = "service_account.json not found"
+        email = await _get_service_account_email()
 
         text = (
             "📊 **Manage Spreadsheet Connection**\n\n"
@@ -1530,7 +1617,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "📌 **How to connect a new Spreadsheet:**\n"
             "1️⃣ **Create:** Open Google Sheets and create a new blank spreadsheet.\n"
             "2️⃣ **Share:** Click the blue *Share* button in the top right corner.\n"
-            f"3️⃣ **Add Bot:** Paste this exact email address and give it **Editor** access:\n`{email}`\n"
+            "3️⃣ **Add Bot:** Paste this exact email address and give it **Editor** access:\n"
+            f"`{email}`\n"
             "4️⃣ **Link:** Tap the *🔗 Set/Change Connection* button below.\n"
             "5️⃣ **Submit:** The bot will ask for the URL. Simply copy the link to your spreadsheet from your browser and send it to the bot.\n"
         )
@@ -1555,11 +1643,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif query.data == "cmd_prompt_sheet_name":
         context.user_data["awaiting_sheet_name"] = True
+
+        # Resolve service-account email for the reminder
+        import json as _json
+        try:
+            if settings.GSHEETS_CONFIG_JSON:
+                _creds = _json.loads(settings.GSHEETS_CONFIG_JSON)
+            else:
+                with open("service_account.json", "r") as _f:
+                    _creds = _json.load(_f)
+            sa_email = _creds.get("client_email", "_(email not found)_")
+        except Exception:
+            sa_email = "_(could not read credentials)_"
+
         text = (
             "📝 **Send the Google Spreadsheet URL**\n\n"
             "Please paste the full link (URL) of your Google Spreadsheet here. "
             "You can also send just the Spreadsheet ID if you prefer.\n\n"
-            "*(⚠️ Reminder: Before linking, please make sure you completed step 3 and added the bot's email to your spreadsheet's Share settings!)*"
+            f"⚠️ *Reminder:* Make sure this email has been added as an *Editor* in your spreadsheet's Share settings:\n`{sa_email}`"
         )
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_manage_sheets")]])
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
@@ -1771,6 +1872,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # --- Order Processing (Moderator & Admin) ---
 
 @require_moderator_or_admin
+@require_spreadsheet
 async def mod_stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show available product stock for moderators (read-only, no business metrics)."""
     async with async_session() as session:
@@ -1835,6 +1937,7 @@ async def _send_lowstock_alert(product_name: str, reporter_name: str, descriptio
 
 
 @require_moderator_or_admin
+@require_spreadsheet
 async def lowstock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Moderator reports a low stock product to admin. Usage: /lowstock <product name>"""
     if not context.args:
@@ -1854,6 +1957,7 @@ async def lowstock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 @require_moderator_or_admin
+@require_spreadsheet
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Processes incoming text messages for orders."""
     text = update.effective_message.text
@@ -1875,11 +1979,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["sa_new_client_token"] = text.strip()
         context.user_data["awaiting_sa_bot_token"] = False
         context.user_data["awaiting_sa_sheet_id"] = True
+
+        # Resolve service-account email — same two-path logic as cmd_manage_sheets
+        import json as _json
+        try:
+            if settings.GSHEETS_CONFIG_JSON:
+                _creds = _json.loads(settings.GSHEETS_CONFIG_JSON)
+            else:
+                with open("service_account.json", "r") as _f:
+                    _creds = _json.load(_f)
+            sa_email = _creds.get("client_email", "_(email not found)_")
+        except Exception:
+            sa_email = "_(could not read credentials)_"
+
         await update.effective_message.reply_text(
             "✅ Token saved.\n\n"
-            "*Step 3 of 3:*\n"
-            "Please send the **Google Sheet Name or ID** you want to link.\n\n"
-            "_(If you don't want to link one right now, just type `skip`)_", 
+            "*Step 3 of 3 — Link a Google Spreadsheet* 📊\n\n"
+            "You can link a Google Spreadsheet so that every order placed through this client's bot is automatically synced there.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "*How to set it up:*\n"
+            "1️⃣ Open Google Sheets and create a new blank spreadsheet.\n"
+            "2️⃣ Click the blue *Share* button (top-right corner).\n"
+            f"3️⃣ Paste this exact email and give it *Editor* access:\n`{sa_email}`\n"
+            "4️⃣ Copy the spreadsheet URL from your browser and paste it here.\n\n"
+            "💡 *You can also paste just the Spreadsheet ID* — the long string between `/d/` and `/edit` in the URL.\n\n"
+            "*(If you don't want to link one right now, type `skip`)*",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu")]])
         )

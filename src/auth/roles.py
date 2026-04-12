@@ -9,6 +9,7 @@ from src.core.context import get_tenant_id, normalize_tenant_id, without_tenant_
 from src.db.session import async_session
 from src.db.models import User, RoleEnum, Invite, PlatformEnum
 from src.core.config import settings
+from src.services import config_service
 
 logger = logging.getLogger(__name__)
 ADMIN_ROLES = (RoleEnum.ADMIN, RoleEnum.SUPERADMIN)
@@ -50,8 +51,14 @@ async def get_user_role(telegram_id: str) -> RoleEnum | None:
     if superadmin_role is not None:
         return superadmin_role
 
+    tid = normalize_tenant_id(get_tenant_id())
     async with async_session() as session:
-        result = await session.execute(select(User).where(User.telegram_id == telegram_id))
+        # Filter by both telegram_id AND tenant_id to support multi-tenant access
+        query = select(User).where(User.telegram_id == telegram_id)
+        if tid:
+            query = query.where(User.tenant_id == tid)
+            
+        result = await session.execute(query)
         user = result.scalar_one_or_none()
 
         if user and user.is_banned:
@@ -87,6 +94,45 @@ def require_admin(func):
             elif update.callback_query:
                 await update.callback_query.answer("⛔ Access Denied. Admin privileges required.", show_alert=True)
             return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+def require_spreadsheet(func):
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        
+        # Check if a spreadsheet is connected
+        sheet_name = await config_service.get_active_sheet_name()
+        if not sheet_name:
+            user_id = str(update.effective_user.id)
+            role = await get_user_role(user_id)
+            
+            # Message for Admin/Superadmin
+            if role in ADMIN_ROLES:
+                msg = (
+                    "📊 **Spreadsheet Required**\n\n"
+                    "Before you can use any tracking features, you must connect a Google Spreadsheet.\n\n"
+                    "**Why?** This ensures all coordinates and orders are safely backed up in real-time.\n\n"
+                    "Tap the button below to start the connection guide:"
+                )
+                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Connect Spreadsheet", callback_data="cmd_manage_sheets")]])
+            else:
+                # Message for Moderators
+                msg = (
+                    "⚠️ **System Not Ready**\n\n"
+                    "Your Admin has not connected a Google Spreadsheet yet. "
+                    "Features will be enabled once the setup is complete.\n\n"
+                    "Please notify your Admin to link a spreadsheet."
+                )
+                keyboard = None
+
+            if update.effective_message:
+                await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=keyboard)
+            elif update.callback_query:
+                await update.callback_query.answer("⚠️ Spreadsheet connection required.", show_alert=True)
+            return
+            
         return await func(update, context, *args, **kwargs)
     return wrapper
 
@@ -166,11 +212,16 @@ async def redeem_invite_code(telegram_id: str, full_name: str, code: str) -> boo
         if not invite:
             return "Invalid or already used invite code."
 
-        # Check if user already exists
-        user_result = await session.execute(select(User).where(User.telegram_id == telegram_id))
+        # Check if user already exists IN THIS TENANT
+        user_result = await session.execute(
+            select(User).where(
+                User.telegram_id == telegram_id,
+                User.tenant_id == invite.tenant_id
+            )
+        )
         user = user_result.scalar_one_or_none()
         if user:
-            return "You are already registered."
+            return "You are already registered for this client."
 
         # For admin invites, enforce max 1 tenant admin
         if invite.role == RoleEnum.ADMIN:
