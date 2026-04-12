@@ -4,12 +4,14 @@ Dashboard API Router
 Serves all JSON endpoints consumed by the web dashboard frontend.
 """
 
+import io
 import logging
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, and_, case, text
 
 from src.db.session import async_session
@@ -357,3 +359,25 @@ async def get_orders(
         "page": page,
         "pages": (total + limit - 1) // limit if limit > 0 else 0
     }
+
+
+# ─────────────────────────────────────────────
+# 9. Excel Export
+# ─────────────────────────────────────────────
+@router.get("/export")
+async def export_orders_excel(
+    days: int = Query(default=0, description="0=all time, 7=last week, 30=last month"),
+    _tid: uuid.UUID = Depends(require_tenant),
+):
+    """Generate and return a styled Excel file of all orders for this tenant."""
+    from src.services.excel_export import generate_orders_excel
+
+    async with async_session() as session:
+        excel_bytes = await generate_orders_excel(session, days=days)
+
+    filename = f"orders_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )

@@ -41,6 +41,14 @@
                 <button class="period-btn" data-days="7">7 Days</button>
                 <button class="period-btn" data-days="30">30 Days</button>
             </div>
+            <button class="refresh-btn" id="export-btn" title="Export to Excel" onclick="exportExcel()" style="background:linear-gradient(135deg,#1f7a3e,#28a745);color:#fff;border-color:transparent;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+                <span>Export Excel</span>
+            </button>
             <button class="refresh-btn" id="refresh-btn" title="Refresh Data">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <polyline points="23 4 23 10 17 10"></polyline>
@@ -264,5 +272,25 @@
 
     <!-- Dashboard JS -->
     <script src="/static/js/dashboard.js"></script>
+    <script>
+        function exportExcel() {
+            const TENANT_ID = new URLSearchParams(window.location.search).get('tenant_id') || '';
+            if (!TENANT_ID) { alert('No tenant selected.'); return; }
+            const btn = document.getElementById('export-btn');
+            btn.disabled = true;
+            btn.querySelector('span').textContent = 'Exporting...';
+            const url = `/api/dashboard/export?tenant_id=${TENANT_ID}&days=0`;
+            fetch(url)
+                .then(r => { if (!r.ok) throw new Error('Export failed'); return r.blob(); })
+                .then(blob => {
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = `orders_export_${new Date().toISOString().slice(0,10)}.xlsx`;
+                    a.click();
+                })
+                .catch(e => alert('Export failed: ' + e.message))
+                .finally(() => { btn.disabled = false; btn.querySelector('span').textContent = 'Export Excel'; });
+        }
+    </script>
 </body>
 </html>

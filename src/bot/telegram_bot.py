@@ -18,7 +18,7 @@ from src.bot.handlers import (
     setstock_command,
     stock_command,
     team_stats_command,
-    check_sheets_command,
+    export_command,
     button_handler,
     handle_message,
     generate_invite_command,
@@ -78,7 +78,7 @@ async def create_bot_application(token: str) -> Application:
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("top", top_command))
     app.add_handler(CommandHandler("pending", pending_command))
-    app.add_handler(CommandHandler("check_sheets", check_sheets_command))
+    app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CommandHandler("setstock", setstock_command))
     app.add_handler(CommandHandler("markpaid", markpaid_command))
     app.add_handler(CommandHandler("stock", stock_command))

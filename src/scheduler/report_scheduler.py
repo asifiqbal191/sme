@@ -19,7 +19,6 @@ from src.core.config import settings
 from src.db.session import async_session
 from src.services import analytics
 from src.services.notifier import send_admin_alert
-from src.services import sheet_sync
 
 logger = logging.getLogger(__name__)
 
@@ -424,15 +423,6 @@ async def start_scheduler():
         # Track which alert jobs are saved as disabled
         if job_cfg.get("enabled_key") and not await get_job_enabled(job_id):
             disabled_jobs.append(job_id)
-
-    # Google Sheets sync retry — always on, not user-configurable
-    scheduler.add_job(
-        sheet_sync.retry_failed_syncs,
-        trigger=IntervalTrigger(minutes=5, timezone=DHAKA_TZ),
-        id="retry_failed_sheet_syncs",
-        name="Retry Failed Google Sheets Syncs",
-        replace_existing=True,
-    )
 
     if TESTING_MODE:
         scheduler.add_job(

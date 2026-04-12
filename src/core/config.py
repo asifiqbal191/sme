@@ -30,11 +30,6 @@ class Settings(BaseSettings):
                     ids.append(cid)
         return ids
 
-    # Google Sheets
-    GOOGLE_SHEET_NAME: str = "Orders Dashboard"
-    GOOGLE_CREDENTIALS_FILE: str = "service_account.json"
-    GSHEETS_CONFIG_JSON: Optional[str] = None # For Railway/Production
-
     DATABASE_URL: Optional[str] = None # Railway provides this
 
     @property
