@@ -10,7 +10,7 @@ from src.services.parser import parse_order_message
 from src.services.order_service import process_telegram_order
 from src.services import tenant_service
 from sqlalchemy import select
-from src.db.models import PlatformEnum, Order, Payment, PaymentStatusEnum
+from src.db.models import PlatformEnum, Order, Payment, PaymentStatusEnum, Product
 from src.services import config_service
 from src.services.config_service import SCHEDULE_JOBS
 from src.bot.bot_manager import bot_manager
@@ -1834,9 +1834,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     return
                 try:
                     if field == "product":
-                        order.product_name = new_val.title()
+                        old_name = order.product_name
+                        new_name = new_val.title()
+                        if old_name != new_name:
+                            # Return stock to the old product
+                            old_prod = (await session.execute(
+                                select(Product).where(Product.name == old_name)
+                            )).scalar_one_or_none()
+                            if old_prod:
+                                old_prod.current_stock += order.quantity
+
+                            # Deduct stock from the new product (if tracked)
+                            new_prod = (await session.execute(
+                                select(Product).where(Product.name == new_name)
+                            )).scalar_one_or_none()
+                            if new_prod:
+                                new_prod.current_stock = max(0, new_prod.current_stock - order.quantity)
+                            else:
+                                session.add(Product(name=new_name, current_stock=0))
+
+                        order.product_name = new_name
+
                     elif field == "qty":
-                        order.quantity = int(new_val)
+                        old_qty = order.quantity
+                        new_qty = int(new_val)
+                        if new_qty < 1:
+                            raise ValueError("Quantity must be at least 1.")
+                        if old_qty != new_qty:
+                            # Adjust stock: positive diff = stock goes up (reduced qty), negative = goes down
+                            qty_diff = old_qty - new_qty
+                            prod = (await session.execute(
+                                select(Product).where(Product.name == order.product_name)
+                            )).scalar_one_or_none()
+                            if prod:
+                                prod.current_stock = max(0, prod.current_stock + qty_diff)
+                        order.quantity = new_qty
+
                     elif field == "price":
                         order.price = float(new_val)
                     elif field == "phone":
@@ -1847,9 +1880,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await session.commit()
                     await session.refresh(order)
                     card = _order_card_text(order)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as exc:
                     await update.effective_message.reply_text(
-                        f"❌ Invalid value `{new_val}` for *{field}*. Please try again.",
+                        f"❌ Invalid value `{new_val}` for *{field}*. {exc}",
                         parse_mode="Markdown"
                     )
                     return
@@ -2094,8 +2127,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
     async with async_session() as session:
-        new_order = await process_telegram_order(parsed, update.effective_message.message_id, session, platform=final_platform, created_by_id=user_id)
-        
+        new_order, error_msg = await process_telegram_order(parsed, update.effective_message.message_id, session, platform=final_platform, created_by_id=user_id)
+
+        if error_msg:
+            await update.effective_message.reply_text(error_msg, parse_mode="Markdown")
+            return
+
         if new_order:
             status_icon = "✅ PAID" if new_order.payment_status.value == "PAID" else "⏳ PENDING"
             confirm_msg = (
