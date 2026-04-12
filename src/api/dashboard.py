@@ -5,18 +5,37 @@ Serves all JSON endpoints consumed by the web dashboard frontend.
 """
 
 import logging
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, func, and_, case, text
 
 from src.db.session import async_session
-from src.db.models import Order, Product, User, Payment, PlatformEnum, PaymentStatusEnum, RoleEnum, DHAKA_TZ
+from src.db.models import Order, Product, User, Payment, PlatformEnum, PaymentStatusEnum, RoleEnum, DHAKA_TZ, Tenant
+from src.core.context import set_tenant_id
 from src.services import analytics
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+
+
+async def require_tenant(tenant_id: str = Query(..., description="Tenant UUID — each client gets their own isolated view")) -> uuid.UUID:
+    """Validate the tenant and set the async context so all DB queries are scoped to it."""
+    try:
+        tid = uuid.UUID(tenant_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid tenant_id — must be a valid UUID")
+
+    async with async_session() as session:
+        result = await session.execute(select(Tenant).where(Tenant.id == tid, Tenant.is_active == True))  # noqa: E712
+        tenant = result.scalar_one_or_none()
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Tenant not found or inactive")
+
+    set_tenant_id(tid)
+    return tid
 
 
 def _now_local():
@@ -27,7 +46,7 @@ def _now_local():
 # 1. KPI Summary
 # ─────────────────────────────────────────────
 @router.get("/summary")
-async def get_summary(days: int = Query(default=0, description="0=today, 7=week, 30=month")):
+async def get_summary(days: int = Query(default=0, description="0=today, 7=week, 30=month"), _tid: uuid.UUID = Depends(require_tenant)):
     """Returns KPI card data for the selected period."""
     now = _now_local()
 
@@ -116,7 +135,7 @@ async def get_summary(days: int = Query(default=0, description="0=today, 7=week,
 # 2. Sales Trend (daily breakdown)
 # ─────────────────────────────────────────────
 @router.get("/sales-trend")
-async def get_sales_trend(days: int = Query(default=30)):
+async def get_sales_trend(days: int = Query(default=30), _tid: uuid.UUID = Depends(require_tenant)):
     """Daily sales & order counts for the last N days."""
     now = _now_local()
     start = now - timedelta(days=days)
@@ -153,7 +172,7 @@ async def get_sales_trend(days: int = Query(default=30)):
 # 3. Platform Distribution
 # ─────────────────────────────────────────────
 @router.get("/platform-split")
-async def get_platform_split(days: int = Query(default=30)):
+async def get_platform_split(days: int = Query(default=30), _tid: uuid.UUID = Depends(require_tenant)):
     """Order count and revenue by platform."""
     now = _now_local()
     start = now - timedelta(days=days) if days > 0 else now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -184,7 +203,7 @@ async def get_platform_split(days: int = Query(default=30)):
 # 4. Top Products
 # ─────────────────────────────────────────────
 @router.get("/top-products")
-async def get_top_products(days: int = Query(default=30), limit: int = Query(default=10)):
+async def get_top_products(days: int = Query(default=30), limit: int = Query(default=10), _tid: uuid.UUID = Depends(require_tenant)):
     """Top products by revenue."""
     now = _now_local()
     start = now - timedelta(days=days) if days > 0 else now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -217,7 +236,7 @@ async def get_top_products(days: int = Query(default=30), limit: int = Query(def
 # 5. Payment Status Breakdown
 # ─────────────────────────────────────────────
 @router.get("/payment-status")
-async def get_payment_status(days: int = Query(default=30)):
+async def get_payment_status(days: int = Query(default=30), _tid: uuid.UUID = Depends(require_tenant)):
     """Payment status distribution."""
     now = _now_local()
     start = now - timedelta(days=days) if days > 0 else now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -248,7 +267,7 @@ async def get_payment_status(days: int = Query(default=30)):
 # 6. Moderator Performance
 # ─────────────────────────────────────────────
 @router.get("/moderators")
-async def get_moderator_performance():
+async def get_moderator_performance(_tid: uuid.UUID = Depends(require_tenant)):
     """All moderators with their stats."""
     async with async_session() as session:
         stats = await analytics.get_all_moderators_stats(session)
@@ -259,7 +278,7 @@ async def get_moderator_performance():
 # 7. Stock Alerts
 # ─────────────────────────────────────────────
 @router.get("/stock-alerts")
-async def get_stock_alerts():
+async def get_stock_alerts(_tid: uuid.UUID = Depends(require_tenant)):
     """Stock predictions for all products."""
     async with async_session() as session:
         predictions = await analytics.get_stock_predictions(session)
@@ -280,7 +299,8 @@ async def get_orders(
     limit: int = Query(default=20, le=100),
     platform: Optional[str] = Query(default=None),
     payment_status: Optional[str] = Query(default=None),
-    search: Optional[str] = Query(default=None)
+    search: Optional[str] = Query(default=None),
+    _tid: uuid.UUID = Depends(require_tenant),
 ):
     """Paginated orders with filters."""
     offset = (page - 1) * limit

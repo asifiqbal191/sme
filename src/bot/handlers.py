@@ -151,7 +151,8 @@ async def _complete_invite_join(update: Update, code: str) -> None:
             "`Product: Exact Product Name`\n"
             "`Qty: 1`\n"
             "`Price: 500`\n"
-            "`Phone: 017XXXXXXXX`\n\n"
+            "`Phone: 017XXXXXXXX`\n"
+            "`Status: pending or paid`\n\n"
             "I will save it and automatically update the Google Sheets database!"
         )
         await update.effective_message.reply_text("📌 Quick access pinned below.", reply_markup=get_moderator_persistent_keyboard())
@@ -187,10 +188,12 @@ def get_superadmin_menu_keyboard():
 
 
 def get_main_menu_keyboard():
+    tid = get_tenant_id()
+    dashboard_url = f"{settings.DASHBOARD_URL}?tenant_id={tid}" if tid else settings.DASHBOARD_URL
     keyboard = [
         [
             InlineKeyboardButton("📊 Today's Sales", callback_data="cmd_today_all"),
-            InlineKeyboardButton("🌍 Web Dashboard", url=settings.DASHBOARD_URL)
+            InlineKeyboardButton("🌍 Web Dashboard", url=dashboard_url)
         ],
         [
             InlineKeyboardButton("📅 Weekly", callback_data="cmd_weekly"),
@@ -506,7 +509,8 @@ async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "`Product: Exact Product Name`\n"
             "`Qty: 1`\n"
             "`Price: 500`\n"
-            "`Phone: 017XXXXXXXX`\n\n"
+            "`Phone: 017XXXXXXXX`\n"
+            "`Status: pending or paid`\n\n"
             "I will save it and automatically update the Google Sheets database!"
         )
         # Show persistent keyboard for moderator

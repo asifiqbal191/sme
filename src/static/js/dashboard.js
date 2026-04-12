@@ -4,6 +4,16 @@
  * Fetches data from /api/dashboard/* and renders KPIs, charts, and tables.
  */
 
+// ── Tenant isolation ──
+// Each client's dashboard URL contains ?tenant_id=<uuid> so queries are scoped.
+const TENANT_ID = new URLSearchParams(window.location.search).get('tenant_id') || '';
+
+function apiUrl(path, params = {}) {
+    const p = new URLSearchParams(params);
+    if (TENANT_ID) p.set('tenant_id', TENANT_ID);
+    return `${path}?${p.toString()}`;
+}
+
 // ── State ──
 let currentDays = 0; // 0 = today, 7 = week, 30 = month
 let currentPage = 1;
@@ -70,7 +80,7 @@ const chartDefaults = {
 // 1. KPI SUMMARY
 // ═══════════════════════════════════════════
 async function loadSummary() {
-    const data = await fetchJSON(`/api/dashboard/summary?days=${currentDays}`);
+    const data = await fetchJSON(apiUrl('/api/dashboard/summary', { days: currentDays }));
     if (!data) return;
 
     document.getElementById('kpi-sales-value').textContent = fmtTaka(data.total_sales);
@@ -96,7 +106,7 @@ async function loadSummary() {
 // ═══════════════════════════════════════════
 async function loadSalesTrend() {
     const days = currentDays === 0 ? 14 : currentDays;
-    const data = await fetchJSON(`/api/dashboard/sales-trend?days=${days}`);
+    const data = await fetchJSON(apiUrl('/api/dashboard/sales-trend', { days }));
     if (!data) return;
 
     const trend = data.trend;
@@ -164,7 +174,7 @@ async function loadSalesTrend() {
 // 3. PLATFORM SPLIT (Donut)
 // ═══════════════════════════════════════════
 async function loadPlatformSplit() {
-    const data = await fetchJSON(`/api/dashboard/platform-split?days=${currentDays}`);
+    const data = await fetchJSON(apiUrl('/api/dashboard/platform-split', { days: currentDays }));
     if (!data) return;
 
     const platforms = data.platforms;
@@ -238,7 +248,7 @@ async function loadPlatformSplit() {
 // 4. TOP PRODUCTS (Horizontal Bar)
 // ═══════════════════════════════════════════
 async function loadTopProducts() {
-    const data = await fetchJSON(`/api/dashboard/top-products?days=${currentDays}&limit=8`);
+    const data = await fetchJSON(apiUrl('/api/dashboard/top-products', { days: currentDays, limit: 8 }));
     if (!data) return;
 
     const products = data.products;
@@ -292,7 +302,7 @@ async function loadTopProducts() {
 // 5. PAYMENT STATUS (Donut)
 // ═══════════════════════════════════════════
 async function loadPaymentStatus() {
-    const data = await fetchJSON(`/api/dashboard/payment-status?days=${currentDays}`);
+    const data = await fetchJSON(apiUrl('/api/dashboard/payment-status', { days: currentDays }));
     if (!data) return;
 
     const statuses = data.statuses;
@@ -365,7 +375,7 @@ async function loadPaymentStatus() {
 // 6. MODERATOR TABLE
 // ═══════════════════════════════════════════
 async function loadModerators() {
-    const data = await fetchJSON('/api/dashboard/moderators');
+    const data = await fetchJSON(apiUrl('/api/dashboard/moderators'));
     if (!data) return;
 
     const tbody = document.getElementById('moderators-tbody');
@@ -403,7 +413,7 @@ async function loadModerators() {
 // 7. STOCK TABLE
 // ═══════════════════════════════════════════
 async function loadStock() {
-    const data = await fetchJSON('/api/dashboard/stock-alerts');
+    const data = await fetchJSON(apiUrl('/api/dashboard/stock-alerts'));
     if (!data) return;
 
     const tbody = document.getElementById('stock-tbody');
@@ -453,12 +463,12 @@ async function loadOrders() {
     const platform = document.getElementById('order-platform-filter').value;
     const status = document.getElementById('order-status-filter').value;
 
-    let url = `/api/dashboard/orders?page=${currentPage}&limit=20`;
-    if (search) url += `&search=${encodeURIComponent(search)}`;
-    if (platform) url += `&platform=${platform}`;
-    if (status) url += `&payment_status=${status}`;
+    const orderParams = { page: currentPage, limit: 20 };
+    if (search) orderParams.search = search;
+    if (platform) orderParams.platform = platform;
+    if (status) orderParams.payment_status = status;
 
-    const data = await fetchJSON(url);
+    const data = await fetchJSON(apiUrl('/api/dashboard/orders', orderParams));
     if (!data) return;
 
     const tbody = document.getElementById('orders-tbody');
