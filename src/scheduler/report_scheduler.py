@@ -461,6 +461,11 @@ def stop_scheduler():
         scheduler = None
 
 
+def _capture_event_loop():
+    """No-op for AsyncIOScheduler — it picks up the current event loop when started."""
+    logger.info("AsyncIOScheduler will use the current event loop.")
+
+
 # ---------------------------------------------------------------------------
 # Runtime reschedule & toggle (called from bot handlers)
 # ---------------------------------------------------------------------------
