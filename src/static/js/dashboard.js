@@ -263,14 +263,19 @@ async function loadTopProducts() {
             height: 300,
         },
         series: [{ name: 'Revenue', data: series }],
+        // For horizontal bars: xaxis = value axis (bottom), yaxis = category axis (left)
         xaxis: {
             ...chartDefaults.xaxis,
             categories,
+            labels: {
+                style: { colors: '#64748b', fontSize: '11px' },
+                formatter: v => `৳${fmt(v)}`   // revenue numbers on bottom
+            }
         },
         yaxis: {
             labels: {
-                style: { colors: '#64748b', fontSize: '11px' },
-                formatter: v => `৳${fmt(v)}`
+                style: { colors: '#64748b', fontSize: '11px' }
+                // no formatter — product names shown as plain text on the left
             }
         },
         plotOptions: {
