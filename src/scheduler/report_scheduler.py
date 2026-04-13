@@ -6,6 +6,10 @@ Sends daily and weekly business reports to Telegram using APScheduler.
 Schedule times and alert on/off states are stored in the GlobalConfig DB table
 so admins can change them at runtime via the bot's Settings menu without
 restarting the server.
+
+Recipients are resolved from the database at runtime:
+  - Every active Tenant's Admin users receive reports via that tenant's bot token.
+  - No env-var chat ID lists needed — the DB IS the source of truth.
 """
 
 import logging
@@ -15,93 +19,120 @@ from apscheduler.triggers.interval import IntervalTrigger
 from datetime import datetime
 from pytz import timezone as pytz_timezone
 
-from src.core.config import settings
 from src.db.session import async_session
 from src.services import analytics
-from src.services.notifier import send_admin_alert
 
 logger = logging.getLogger(__name__)
 
 DHAKA_TZ = pytz_timezone("Asia/Dhaka")
 
+
 # ---------------------------------------------------------------------------
-# Telegram message sender
+# Recipient resolution — pull from DB, no env vars needed
 # ---------------------------------------------------------------------------
 
-async def _send_telegram_message(text: str):
-    """Send a message to all configured report chat IDs."""
+async def _get_tenant_recipients() -> list[tuple]:
+    """
+    Returns a list of (bot_token, admin_chat_id, tenant_id) for every active
+    tenant that has at least one non-banned admin.  Reports are sent to each
+    admin via that tenant's own bot token.
+    """
+    from src.db.models import Tenant, User, RoleEnum
+    from sqlalchemy import select, and_
+
+    recipients = []
+    async with async_session() as session:
+        tenants_result = await session.execute(
+            select(Tenant).where(Tenant.is_active == True)  # noqa: E712
+        )
+        tenants = tenants_result.scalars().all()
+
+        for tenant in tenants:
+            admins_result = await session.execute(
+                select(User).where(
+                    and_(
+                        User.tenant_id == tenant.id,
+                        User.role == RoleEnum.ADMIN,
+                        User.is_banned == False,  # noqa: E712
+                    )
+                )
+            )
+            for admin in admins_result.scalars().all():
+                recipients.append((tenant.bot_token, admin.telegram_id, tenant.id))
+
+    if not recipients:
+        logger.warning("No active tenants with admins found — report delivery skipped.")
+    return recipients
+
+
+# ---------------------------------------------------------------------------
+# Low-level sender
+# ---------------------------------------------------------------------------
+
+async def _send_message(bot_token: str, chat_id: str, text: str) -> None:
+    """Send a Telegram message via a specific bot token."""
     import httpx
 
-    chat_ids = settings.report_chat_ids
-    token = settings.TELEGRAM_BOT_TOKEN
-
-    if not chat_ids or not token:
-        logger.warning("No report chat IDs or TELEGRAM_BOT_TOKEN configured. Skipping report.")
-        return
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-
-    async with httpx.AsyncClient() as client:
-        for chat_id in chat_ids:
-            payload = {
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "Markdown",
-            }
-            try:
-                resp = await client.post(url, json=payload, timeout=30)
-                if resp.status_code == 200:
-                    logger.info(f"Report sent to chat_id: {chat_id}")
-                else:
-                    logger.error(f"Failed to send to {chat_id}: {resp.status_code} — {resp.text}")
-            except Exception as e:
-                logger.error(f"Error sending to {chat_id}: {e}")
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json=payload, timeout=30)
+            if resp.status_code == 200:
+                logger.info(f"Report sent → chat {chat_id}")
+            else:
+                logger.error(f"Telegram error for chat {chat_id}: {resp.status_code} — {resp.text}")
+    except Exception as e:
+        logger.error(f"HTTP error sending to {chat_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
-# Report generators
+# Report generators — each iterates all tenants
 # ---------------------------------------------------------------------------
 
 async def _generate_daily_report():
-    """Build and send the enhanced intelligent daily report."""
-    logger.info("Generating intelligent daily report...")
-    try:
-        async with async_session() as session:
-            # 1. Basic Stats
-            today_stats = await analytics.get_daily_sales(session)
-            total_sales = today_stats["total_sales"]
-            order_count = today_stats["total_orders"]
+    """Build and send the enhanced intelligent daily report to every tenant's admin."""
+    logger.info("Generating daily report for all tenants...")
+    recipients = await _get_tenant_recipients()
 
-            # 2. Performance Insight (Today vs Yesterday)
-            yesterday_stats = await analytics.get_yesterday_sales(session)
-            yesterday_sales = yesterday_stats["total_sales"]
+    for bot_token, chat_id, tenant_id in recipients:
+        try:
+            async with async_session() as session:
+                # Basic stats — scoped to this tenant
+                today_stats = await analytics.get_daily_sales(session, tenant_id=tenant_id)
+                total_sales = today_stats["total_sales"]
+                order_count = today_stats["total_orders"]
 
-            growth_str = "0%"
+                yesterday_stats = await analytics.get_yesterday_sales(session, tenant_id=tenant_id)
+                yesterday_sales = yesterday_stats["total_sales"]
+
+                top = await analytics.get_today_top_product(session, tenant_id=tenant_id)
+
+                now_dhaka = datetime.now(DHAKA_TZ).replace(tzinfo=None)
+                start_of_day = now_dhaka.replace(hour=0, minute=0, second=0, microsecond=0)
+                breakdown = await analytics.get_revenue_breakdown(
+                    session, start_of_day, now_dhaka, tenant_id=tenant_id
+                )
+
+            # Growth
             if yesterday_sales > 0:
                 growth = ((total_sales - yesterday_sales) / yesterday_sales) * 100
                 growth_str = f"{'+' if growth >= 0 else ''}{growth:.1f}%"
             elif total_sales > 0:
                 growth_str = "+100%"
+            else:
+                growth_str = "0%"
 
-            # 3. Product Analysis (Top product + contribution)
-            top = await analytics.get_today_top_product(session)
-
-            # 4. Revenue Breakdown (Top 3)
-            now_dhaka = datetime.now(DHAKA_TZ).replace(tzinfo=None)
-            start_of_day = now_dhaka.replace(hour=0, minute=0, second=0, microsecond=0)
-
-            breakdown = await analytics.get_revenue_breakdown(session, start_of_day, now_dhaka)
-
-            # 5. Alert System
+            # Alerts
+            alerts = []
             LOW_SALES_THRESHOLD = 1000.0
             LOW_ORDERS_THRESHOLD = 2
-            alerts = []
             if total_sales < LOW_SALES_THRESHOLD:
                 alerts.append("⚠️ Low sales detected today")
             if order_count < LOW_ORDERS_THRESHOLD:
                 alerts.append("⚠️ Order volume is low")
 
-            # 6. AI Recommendations
+            # AI recommendations
             recommendations = []
             if growth_str.startswith('+'):
                 val = float(growth_str.strip('+%'))
@@ -123,240 +154,218 @@ async def _generate_daily_report():
             if not recommendations:
                 recommendations.append("✅ Monitoring looks good. Focus on customer response speed.")
 
-            # Build Message
+            # Build message
             msg_parts = [
-                f"📊 *Daily Report:*",
+                "📊 *Daily Report:*",
                 f"Sales: ৳{total_sales:,.2f}",
                 f"Orders: {order_count}",
-                f"",
-                f"📈 *Performance Insight:*",
+                "",
+                "📈 *Performance Insight:*",
                 f"Sales Change: *{growth_str}* (vs yesterday)",
-                f""
+                "",
             ]
 
             if top:
                 contribution = (top["revenue"] / total_sales) * 100 if total_sales > 0 else 0
-                msg_parts.extend([
-                    f"🔥 *Top Product:*",
+                msg_parts += [
+                    "🔥 *Top Product:*",
                     f"{top['product_name']} ({top['quantity']} sold)",
-                    f"",
-                    f"💡 *Insight:*",
+                    "",
+                    "💡 *Insight:*",
                     f"This product contributed {contribution:.1f}% of total sales",
-                    f""
-                ])
+                    "",
+                ]
 
             if breakdown:
-                msg_parts.append(f"💰 *Revenue Breakdown:*")
+                msg_parts.append("💰 *Revenue Breakdown:*")
                 for item in breakdown:
                     msg_parts.append(f"{item['product_name']} → ৳{item['revenue']:,.2f}")
                 msg_parts.append("")
 
             if alerts:
-                msg_parts.extend(alerts)
+                msg_parts += alerts
                 msg_parts.append("")
 
-            msg_parts.append(f"🤖 *AI Recommendation:*")
+            msg_parts.append("🤖 *AI Recommendation:*")
             for rec in recommendations:
                 msg_parts.append(f"- {rec}")
 
-            await _send_telegram_message("\n".join(msg_parts))
-            logger.info("Intelligent daily report task completed.")
+            await _send_message(bot_token, chat_id, "\n".join(msg_parts))
+            logger.info(f"Daily report sent for tenant {tenant_id} → chat {chat_id}")
 
-    except Exception as e:
-        logger.error(f"Error generating intelligent daily report: {e}", exc_info=True)
-        await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Daily Report\nError: `{str(e)[:200]}`")
+        except Exception as e:
+            logger.error(f"Error generating daily report for tenant {tenant_id}: {e}", exc_info=True)
 
 
 async def _generate_weekly_report():
-    """Build and send the weekly sales report."""
-    logger.info("Generating weekly report...")
-    try:
-        async with async_session() as session:
-            stats = await analytics.get_weekly_sales(session)
-            top = await analytics.get_weekly_top_product(session)
+    """Send the weekly sales report to every tenant's admin."""
+    logger.info("Generating weekly report for all tenants...")
+    recipients = await _get_tenant_recipients()
 
-        weekly_sales = stats["total_sales"]
+    for bot_token, chat_id, tenant_id in recipients:
+        try:
+            async with async_session() as session:
+                stats = await analytics.get_weekly_sales(session, tenant_id=tenant_id)
+                top = await analytics.get_weekly_top_product(session, tenant_id=tenant_id)
 
-        msg = (
-            f"📊 *Weekly Report:*\n"
-            f"Sales: ৳{weekly_sales:,.2f}\n"
-        )
-
-        if top:
-            msg += (
-                f"\n🏆 *Top Product:*\n"
-                f"{top['product_name']} ({top['quantity']} sold)"
+            msg = (
+                f"📊 *Weekly Report:*\n"
+                f"Sales: ৳{stats['total_sales']:,.2f}\n"
+                f"Orders: {stats['total_orders']}"
             )
-        else:
-            msg += "\n_No sales recorded this week._"
+            if top:
+                msg += f"\n\n🏆 *Top Product:*\n{top['product_name']} ({top['quantity']} sold)"
+            else:
+                msg += "\n\n_No sales recorded this week._"
 
-        await _send_telegram_message(msg)
-        logger.info("Weekly report task completed.")
+            await _send_message(bot_token, chat_id, msg)
 
-    except Exception as e:
-        logger.error(f"Error generating weekly report: {e}", exc_info=True)
-        await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Weekly Report\nError: `{str(e)[:200]}`")
+        except Exception as e:
+            logger.error(f"Error generating weekly report for tenant {tenant_id}: {e}", exc_info=True)
 
 
 async def _generate_monthly_report():
-    """Build and send the monthly sales report."""
-    logger.info("Generating monthly report...")
-    try:
-        async with async_session() as session:
-            stats = await analytics.get_monthly_sales(session)
-            top = await analytics.get_monthly_top_product(session)
+    """Send the monthly sales report to every tenant's admin."""
+    logger.info("Generating monthly report for all tenants...")
+    recipients = await _get_tenant_recipients()
 
-        monthly_sales = stats["total_sales"]
+    for bot_token, chat_id, tenant_id in recipients:
+        try:
+            async with async_session() as session:
+                stats = await analytics.get_monthly_sales(session, tenant_id=tenant_id)
+                top = await analytics.get_monthly_top_product(session, tenant_id=tenant_id)
 
-        msg = (
-            f"📊 *Monthly Report:*\n"
-            f"Sales: ৳{monthly_sales:,.2f}\n"
-        )
-
-        if top:
-            msg += (
-                f"\n🏆 *Top Product:*\n"
-                f"{top['product_name']} ({top['quantity']} sold)"
+            msg = (
+                f"📊 *Monthly Report:*\n"
+                f"Sales: ৳{stats['total_sales']:,.2f}\n"
+                f"Orders: {stats['total_orders']}"
             )
-        else:
-            msg += "\n_No sales recorded this month._"
+            if top:
+                msg += f"\n\n🏆 *Top Product:*\n{top['product_name']} ({top['quantity']} sold)"
+            else:
+                msg += "\n\n_No sales recorded this month._"
 
-        await _send_telegram_message(msg)
-        logger.info("Monthly report task completed.")
+            await _send_message(bot_token, chat_id, msg)
 
-    except Exception as e:
-        logger.error(f"Error generating monthly report: {e}", exc_info=True)
-        await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Monthly Report\nError: `{str(e)[:200]}`")
+        except Exception as e:
+            logger.error(f"Error generating monthly report for tenant {tenant_id}: {e}", exc_info=True)
 
 
 async def _check_sales_drop():
-    """
-    Checks if today's sales are lower than yesterday's sales and sends an alert.
-    """
-    logger.info("Checking for sales drop...")
-    try:
-        async with async_session() as session:
-            today_stats = await analytics.get_daily_sales(session)
-            yesterday_stats = await analytics.get_yesterday_sales(session)
+    """Alert if today's sales are lower than yesterday's."""
+    logger.info("Checking sales drop for all tenants...")
+    recipients = await _get_tenant_recipients()
 
-        today_sales = today_stats["total_sales"]
-        yesterday_sales = yesterday_stats["total_sales"]
+    for bot_token, chat_id, tenant_id in recipients:
+        try:
+            async with async_session() as session:
+                today_stats = await analytics.get_daily_sales(session, tenant_id=tenant_id)
+                yesterday_stats = await analytics.get_yesterday_sales(session, tenant_id=tenant_id)
 
-        if today_sales < yesterday_sales:
-            msg = (
-                f"⚠️ *Sales Alert:*\n"
-                f"Today's sales dropped compared to yesterday.\n\n"
-                f"Yesterday: ৳{yesterday_sales:,.2f}\n"
-                f"Today: ৳{today_sales:,.2f}"
-            )
-            await _send_telegram_message(msg)
-            logger.info(f"Sales drop alert sent! Today: {today_sales}, Yesterday: {yesterday_sales}")
-        else:
-            logger.info(f"No sales drop detected. Today: {today_sales}, Yesterday: {yesterday_sales}")
+            today_sales = today_stats["total_sales"]
+            yesterday_sales = yesterday_stats["total_sales"]
 
-    except Exception as e:
-        logger.error(f"Error checking sales drop: {e}", exc_info=True)
-        await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Sales Drop Alert\nError: `{str(e)[:200]}`")
+            if today_sales < yesterday_sales:
+                msg = (
+                    f"⚠️ *Sales Alert:*\n"
+                    f"Today's sales dropped vs yesterday.\n\n"
+                    f"Yesterday: ৳{yesterday_sales:,.2f}\n"
+                    f"Today: ৳{today_sales:,.2f}"
+                )
+                await _send_message(bot_token, chat_id, msg)
+                logger.info(f"Sales drop alert sent for tenant {tenant_id}")
+            else:
+                logger.info(f"No sales drop for tenant {tenant_id} (today={today_sales}, yesterday={yesterday_sales})")
+
+        except Exception as e:
+            logger.error(f"Error checking sales drop for tenant {tenant_id}: {e}", exc_info=True)
 
 
 async def _trending_product_alert():
-    """
-    Detects top-selling product of the day and notifies user.
-    """
-    logger.info("Checking for trending product...")
-    try:
-        async with async_session() as session:
-            top = await analytics.get_top_product(session)
+    """Alert about the top-selling product of the day."""
+    logger.info("Checking trending product for all tenants...")
+    recipients = await _get_tenant_recipients()
 
-        if top and top["quantity"] > 0:
-            msg = (
-                f"🔥 *Trending Product Alert:*\n"
-                f"Top product today is:\n\n"
-                f"*{top['product_name']}*\n"
-                f"Sold: {top['quantity']} units"
-            )
-            await _send_telegram_message(msg)
-            logger.info(f"Trending product alert sent: {top['product_name']} ({top['quantity']} units)")
-        else:
-            logger.info("No sales today. Skipping trending product alert.")
+    for bot_token, chat_id, tenant_id in recipients:
+        try:
+            async with async_session() as session:
+                top = await analytics.get_top_product(session, tenant_id=tenant_id)
 
-    except Exception as e:
-        logger.error(f"Error generating trending product alert: {e}", exc_info=True)
-        await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Trending Product Alert\nError: `{str(e)[:200]}`")
+            if top and top["quantity"] > 0:
+                msg = (
+                    f"🔥 *Trending Product Alert:*\n"
+                    f"Top product today:\n\n"
+                    f"*{top['product_name']}*\n"
+                    f"Sold: {top['quantity']} units"
+                )
+                await _send_message(bot_token, chat_id, msg)
+
+        except Exception as e:
+            logger.error(f"Error trending product alert for tenant {tenant_id}: {e}", exc_info=True)
 
 
 async def _generate_growth_report():
-    """
-    Calculates growth (today vs yesterday) and sends report.
-    """
-    logger.info("Generating growth report...")
-    try:
-        async with async_session() as session:
-            today_stats = await analytics.get_daily_sales(session)
-            yesterday_stats = await analytics.get_yesterday_sales(session)
+    """Calculate today vs yesterday growth and send report."""
+    logger.info("Generating growth report for all tenants...")
+    recipients = await _get_tenant_recipients()
 
-        today = today_stats["total_sales"]
-        yesterday = yesterday_stats["total_sales"]
+    for bot_token, chat_id, tenant_id in recipients:
+        try:
+            async with async_session() as session:
+                today_stats = await analytics.get_daily_sales(session, tenant_id=tenant_id)
+                yesterday_stats = await analytics.get_yesterday_sales(session, tenant_id=tenant_id)
 
-        if yesterday == 0:
-            if today > 0:
-                growth_pct = 100.0
-                growth_str = f"+{growth_pct:.1f}%"
+            today = today_stats["total_sales"]
+            yesterday = yesterday_stats["total_sales"]
+
+            if yesterday == 0:
+                growth_str = "+100%" if today > 0 else "0%"
             else:
-                growth_pct = 0.0
-                growth_str = "0%"
-        else:
-            growth_pct = ((today - yesterday) / yesterday) * 100
-            sign = "+" if growth_pct >= 0 else ""
-            growth_str = f"{sign}{growth_pct:.1f}%"
+                growth_pct = ((today - yesterday) / yesterday) * 100
+                sign = "+" if growth_pct >= 0 else ""
+                growth_str = f"{sign}{growth_pct:.1f}%"
 
-        msg = (
-            f"📊 *Growth Report:*\n"
-            f"Sales Change: *{growth_str}*\n\n"
-            f"Yesterday: ৳{yesterday:,.2f}\n"
-            f"Today: ৳{today:,.2f}"
-        )
+            msg = (
+                f"📊 *Growth Report:*\n"
+                f"Sales Change: *{growth_str}*\n\n"
+                f"Yesterday: ৳{yesterday:,.2f}\n"
+                f"Today: ৳{today:,.2f}"
+            )
+            await _send_message(bot_token, chat_id, msg)
 
-        await _send_telegram_message(msg)
-        logger.info(f"Growth report sent! Growth: {growth_str}")
-
-    except Exception as e:
-        logger.error(f"Error generating growth report: {e}", exc_info=True)
-        await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Growth Report\nError: `{str(e)[:200]}`")
+        except Exception as e:
+            logger.error(f"Error growth report for tenant {tenant_id}: {e}", exc_info=True)
 
 
 async def _check_stock_prediction_alerts():
-    """
-    Predicts when products will run out and sends alerts for those < 5 days.
-    """
-    logger.info("Checking for stock prediction alerts...")
-    try:
-        async with async_session() as session:
-            predictions = await analytics.get_stock_predictions(session)
+    """Warn when products may run out within 5 days."""
+    logger.info("Checking stock predictions for all tenants...")
+    recipients = await _get_tenant_recipients()
 
-        alerts_sent = 0
-        for p in predictions:
-            days = p["days_remaining"]
-            if days < 5:
-                days_str = f"{days:.1f}" if days > 0 else "0"
-                msg = (
-                    f"📦 *Stock Alert:*\n"
-                    f"*{p['product_name']}* may run out in *{days_str}* days.\n\n"
-                    f"Current Stock: {p['current_stock']} units\n"
-                    f"Avg Daily Sales: {p['avg_daily_sales']:.2f} units"
-                )
-                await _send_telegram_message(msg)
-                alerts_sent += 1
-                logger.info(f"Stock alert sent for {p['product_name']}: {days_str} days remaining.")
+    for bot_token, chat_id, tenant_id in recipients:
+        try:
+            async with async_session() as session:
+                predictions = await analytics.get_stock_predictions(session, tenant_id=tenant_id)
 
-        if alerts_sent == 0:
-            logger.info("No stock alerts needed today.")
-        else:
-            logger.info(f"Total stock alerts sent: {alerts_sent}")
+            alerts_sent = 0
+            for p in predictions:
+                days_left = p["days_remaining"]
+                if days_left < 5:
+                    days_str = f"{days_left:.1f}" if days_left > 0 else "0"
+                    msg = (
+                        f"📦 *Stock Alert:*\n"
+                        f"*{p['product_name']}* may run out in *{days_str}* days.\n\n"
+                        f"Current Stock: {p['current_stock']} units\n"
+                        f"Avg Daily Sales: {p['avg_daily_sales']:.2f} units"
+                    )
+                    await _send_message(bot_token, chat_id, msg)
+                    alerts_sent += 1
 
-    except Exception as e:
-        logger.error(f"Error checking stock prediction alerts: {e}", exc_info=True)
-        await send_admin_alert(f"🚨 *Scheduler Error*\n\nJob: Stock Prediction Alert\nError: `{str(e)[:200]}`")
+            if alerts_sent:
+                logger.info(f"Sent {alerts_sent} stock alerts for tenant {tenant_id}")
+
+        except Exception as e:
+            logger.error(f"Error stock prediction alert for tenant {tenant_id}: {e}", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -365,10 +374,8 @@ async def _check_stock_prediction_alerts():
 
 scheduler: AsyncIOScheduler | None = None
 
-# Set this to False to disable the 1-minute test job
 TESTING_MODE = False
 
-# Maps job IDs to their generator functions
 _JOB_FUNCS = {
     "daily_report": _generate_daily_report,
     "weekly_report": _generate_weekly_report,
@@ -381,7 +388,6 @@ _JOB_FUNCS = {
 
 
 def _make_trigger(job_id: str, hour: int, minute: int) -> CronTrigger:
-    """Build the correct CronTrigger for a given job ID and time."""
     if job_id == "weekly_report":
         return CronTrigger(day_of_week="fri", hour=hour, minute=minute, timezone=DHAKA_TZ)
     if job_id == "monthly_report":
@@ -392,7 +398,7 @@ def _make_trigger(job_id: str, hour: int, minute: int) -> CronTrigger:
 async def start_scheduler():
     """Initialize and start the APScheduler AsyncIOScheduler.
 
-    Times and enabled states are loaded from the DB so admin customizations
+    Times and enabled states are loaded from the DB so admin customisations
     made via the bot's Settings menu persist across restarts.
     """
     global scheduler
@@ -405,7 +411,6 @@ async def start_scheduler():
 
     scheduler = AsyncIOScheduler(timezone=DHAKA_TZ)
 
-    # Register all report/alert jobs with DB-persisted (or default) times
     disabled_jobs: list[str] = []
     for job_id, job_cfg in SCHEDULE_JOBS.items():
         time_str = await get_job_time(job_id)
@@ -420,7 +425,6 @@ async def start_scheduler():
             replace_existing=True,
         )
 
-        # Track which alert jobs are saved as disabled
         if job_cfg.get("enabled_key") and not await get_job_enabled(job_id):
             disabled_jobs.append(job_id)
 
@@ -442,7 +446,6 @@ async def start_scheduler():
 
     scheduler.start()
 
-    # Pause disabled alert jobs now that the scheduler is running
     for job_id in disabled_jobs:
         scheduler.pause_job(job_id)
         logger.info(f"Alert job '{job_id}' is disabled — paused.")
@@ -451,7 +454,6 @@ async def start_scheduler():
 
 
 def stop_scheduler():
-    """Gracefully shut down the scheduler."""
     global scheduler
     if scheduler and scheduler.running:
         scheduler.shutdown(wait=False)
@@ -459,20 +461,12 @@ def stop_scheduler():
         scheduler = None
 
 
-def _capture_event_loop():
-    """No-op for AsyncIOScheduler — it picks up the current loop when started."""
-    logger.info("AsyncIOScheduler will use the current event loop.")
-
-
 # ---------------------------------------------------------------------------
 # Runtime reschedule & toggle (called from bot handlers)
 # ---------------------------------------------------------------------------
 
 async def reschedule_job_time(job_id: str, hour: int, minute: int) -> bool:
-    """Persist the new time to DB and reschedule the live job immediately.
-
-    Returns True on success, False if the job_id is unknown or scheduler is down.
-    """
+    """Persist the new time to DB and reschedule the live job immediately."""
     from src.services.config_service import SCHEDULE_JOBS, set_job_time
 
     if job_id not in SCHEDULE_JOBS or scheduler is None:
@@ -486,12 +480,7 @@ async def reschedule_job_time(job_id: str, hour: int, minute: int) -> bool:
 
 
 async def toggle_job_enabled(job_id: str) -> bool | None:
-    """Toggle an alert job on or off.
-
-    Persists the new state to DB and pauses/resumes the live job.
-    Returns the new enabled state (True/False), or None if the job cannot be toggled
-    (i.e. always-on reports) or the scheduler is not running.
-    """
+    """Toggle an alert job on or off; persist and apply live."""
     from src.services.config_service import SCHEDULE_JOBS, get_job_enabled, set_job_enabled
 
     if job_id not in SCHEDULE_JOBS or scheduler is None:
@@ -499,7 +488,7 @@ async def toggle_job_enabled(job_id: str) -> bool | None:
 
     cfg = SCHEDULE_JOBS[job_id]
     if not cfg.get("enabled_key"):
-        return None  # Always-on job — cannot be toggled
+        return None  # Always-on job
 
     is_on = await get_job_enabled(job_id)
     new_state = not is_on
