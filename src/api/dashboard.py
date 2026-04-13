@@ -12,7 +12,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, and_, case, text
+from sqlalchemy import select, func, and_, text, or_
 
 from src.db.session import async_session
 from src.db.models import Order, Product, User, Payment, PlatformEnum, PaymentStatusEnum, RoleEnum, DHAKA_TZ, Tenant
@@ -69,28 +69,36 @@ async def get_summary(days: int = Query(default=0, description="0=today, 7=week,
         label = "Last 30 Days"
 
     async with async_session() as session:
-        # Current period
-        current = await analytics.get_sales_for_range(session, start, now)
+        # Current period — explicit tenant_id bypasses with_loader_criteria for aggregate queries
+        current = await analytics.get_sales_for_range(session, start, now, tenant_id=_tid)
 
         # Previous period (for trend)
-        previous = await analytics.get_sales_for_range(session, prev_start, prev_end)
+        previous = await analytics.get_sales_for_range(session, prev_start, prev_end, tenant_id=_tid)
 
         # Payment status breakdown (current period)
         pay_q = select(
             Order.payment_status,
             func.count(Order.id).label("cnt"),
             func.sum(Order.price).label("amount")
-        ).where(Order.timestamp >= start).group_by(Order.payment_status)
+        ).where(
+            Order.tenant_id == _tid,
+            Order.timestamp >= start
+        ).group_by(Order.payment_status)
         pay_result = await session.execute(pay_q)
         payment_data = {str(r.payment_status): {"count": int(r.cnt), "amount": float(r.amount or 0)} for r in pay_result}
 
         # Active products & moderators
         active_products = await session.execute(
-            select(func.count(func.distinct(Order.product_name))).where(Order.timestamp >= start)
+            select(func.count(func.distinct(Order.product_name))).where(
+                Order.tenant_id == _tid,
+                Order.timestamp >= start
+            )
         )
         active_mods = await session.execute(
             select(func.count(func.distinct(Order.created_by_id))).where(
-                Order.timestamp >= start, Order.created_by_id != None  # noqa: E711
+                Order.tenant_id == _tid,
+                Order.timestamp >= start,
+                Order.created_by_id != None  # noqa: E711
             )
         )
 
@@ -140,15 +148,20 @@ async def get_summary(days: int = Query(default=0, description="0=today, 7=week,
 async def get_sales_trend(days: int = Query(default=30), _tid: uuid.UUID = Depends(require_tenant)):
     """Daily sales & order counts for the last N days."""
     now = _now_local()
-    start = now - timedelta(days=days)
+    if days == 0:
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start = now - timedelta(days=days)
 
     async with async_session() as session:
-        # Group orders by date
         q = select(
             func.date(Order.timestamp).label("day"),
             func.sum(Order.price).label("sales"),
             func.count(Order.id).label("orders")
-        ).where(Order.timestamp >= start).group_by(func.date(Order.timestamp)).order_by(text("day"))
+        ).where(
+            Order.tenant_id == _tid,
+            Order.timestamp >= start
+        ).group_by(func.date(Order.timestamp)).order_by(text("day"))
 
         result = await session.execute(q)
         rows = result.all()
@@ -177,14 +190,20 @@ async def get_sales_trend(days: int = Query(default=30), _tid: uuid.UUID = Depen
 async def get_platform_split(days: int = Query(default=30), _tid: uuid.UUID = Depends(require_tenant)):
     """Order count and revenue by platform."""
     now = _now_local()
-    start = now - timedelta(days=days) if days > 0 else now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if days == 0:
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start = now - timedelta(days=days)
 
     async with async_session() as session:
         q = select(
             Order.platform,
             func.count(Order.id).label("orders"),
             func.sum(Order.price).label("sales")
-        ).where(Order.timestamp >= start).group_by(Order.platform)
+        ).where(
+            Order.tenant_id == _tid,
+            Order.timestamp >= start
+        ).group_by(Order.platform)
 
         result = await session.execute(q)
         rows = result.all()
@@ -208,7 +227,10 @@ async def get_platform_split(days: int = Query(default=30), _tid: uuid.UUID = De
 async def get_top_products(days: int = Query(default=30), limit: int = Query(default=10), _tid: uuid.UUID = Depends(require_tenant)):
     """Top products by revenue."""
     now = _now_local()
-    start = now - timedelta(days=days) if days > 0 else now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if days == 0:
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start = now - timedelta(days=days)
 
     async with async_session() as session:
         q = select(
@@ -216,6 +238,7 @@ async def get_top_products(days: int = Query(default=30), limit: int = Query(def
             func.sum(Order.quantity).label("total_qty"),
             func.sum(Order.price).label("total_revenue")
         ).where(
+            Order.tenant_id == _tid,
             Order.timestamp >= start
         ).group_by(Order.product_name).order_by(text("total_revenue DESC")).limit(limit)
 
@@ -241,14 +264,20 @@ async def get_top_products(days: int = Query(default=30), limit: int = Query(def
 async def get_payment_status(days: int = Query(default=30), _tid: uuid.UUID = Depends(require_tenant)):
     """Payment status distribution."""
     now = _now_local()
-    start = now - timedelta(days=days) if days > 0 else now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if days == 0:
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start = now - timedelta(days=days)
 
     async with async_session() as session:
         q = select(
             Order.payment_status,
             func.count(Order.id).label("count"),
             func.sum(Order.price).label("amount")
-        ).where(Order.timestamp >= start).group_by(Order.payment_status)
+        ).where(
+            Order.tenant_id == _tid,
+            Order.timestamp >= start
+        ).group_by(Order.payment_status)
 
         result = await session.execute(q)
         rows = result.all()
@@ -272,7 +301,7 @@ async def get_payment_status(days: int = Query(default=30), _tid: uuid.UUID = De
 async def get_moderator_performance(_tid: uuid.UUID = Depends(require_tenant)):
     """All moderators with their stats."""
     async with async_session() as session:
-        stats = await analytics.get_all_moderators_stats(session)
+        stats = await analytics.get_all_moderators_stats(session, tenant_id=_tid)
     return {"moderators": stats}
 
 
@@ -283,8 +312,8 @@ async def get_moderator_performance(_tid: uuid.UUID = Depends(require_tenant)):
 async def get_stock_alerts(_tid: uuid.UUID = Depends(require_tenant)):
     """Stock predictions for all products."""
     async with async_session() as session:
-        predictions = await analytics.get_stock_predictions(session)
-        all_products = await analytics.get_all_products(session)
+        predictions = await analytics.get_stock_predictions(session, tenant_id=_tid)
+        all_products = await analytics.get_all_products(session, tenant_id=_tid)
 
     return {
         "predictions": predictions,
@@ -302,24 +331,27 @@ async def get_orders(
     platform: Optional[str] = Query(default=None),
     payment_status: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
+    days: int = Query(default=0, description="0=all time for this tenant, otherwise filter by period"),
     _tid: uuid.UUID = Depends(require_tenant),
 ):
     """Paginated orders with filters."""
     offset = (page - 1) * limit
+    now = _now_local()
 
     async with async_session() as session:
-        conditions = []
+        # Always scope by tenant explicitly
+        conditions = [Order.tenant_id == _tid]
+
+        if days > 0:
+            start = now - timedelta(days=days)
+            conditions.append(Order.timestamp >= start)
+
         if platform:
             conditions.append(Order.platform == platform)
         if payment_status:
             conditions.append(Order.payment_status == payment_status)
 
-        # Base query
-        base = select(Order)
-        count_q = select(func.count(Order.id))
-
         if search:
-            from sqlalchemy import or_
             search_cond = or_(
                 Order.product_name.ilike(f"%{search}%"),
                 Order.phone_number.ilike(f"%{search}%"),
@@ -327,9 +359,8 @@ async def get_orders(
             )
             conditions.append(search_cond)
 
-        if conditions:
-            base = base.where(and_(*conditions))
-            count_q = count_q.where(and_(*conditions))
+        base = select(Order).where(and_(*conditions))
+        count_q = select(func.count(Order.id)).where(and_(*conditions))
 
         # Total count
         total_result = await session.execute(count_q)

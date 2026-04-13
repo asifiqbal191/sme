@@ -539,6 +539,25 @@ async function loadAll() {
 // ═══════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', () => {
 
+    // Guard: show a clear message when tenant_id is missing from the URL
+    if (!TENANT_ID) {
+        document.querySelector('.dashboard-main').innerHTML = `
+            <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+                        height:60vh;gap:16px;color:var(--text-secondary);text-align:center;padding:2rem;">
+                <svg width="52" height="52" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <circle cx="12" cy="12" r="10"/>
+                    <line x1="12" y1="8" x2="12" y2="12"/>
+                    <line x1="12" y1="16" x2="12.01" y2="16"/>
+                </svg>
+                <h2 style="color:var(--text-primary);margin:0">No Tenant Selected</h2>
+                <p style="margin:0;max-width:440px;">
+                    Add <code style="background:rgba(255,255,255,0.08);padding:2px 8px;border-radius:4px;
+                                     font-size:0.9em;">?tenant_id=YOUR_UUID</code> to the URL to load your dashboard.
+                </p>
+            </div>`;
+        return;
+    }
+
     // Period selector
     document.querySelectorAll('.period-btn').forEach(btn => {
         btn.addEventListener('click', () => {
