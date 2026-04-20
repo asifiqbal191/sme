@@ -54,7 +54,10 @@ async def lifespan(app: FastAPI):
         logger.error(f"Auto-seeding failed (non-fatal): {e}", exc_info=True)
 
     logger.info("Starting up Telegram Bots for all tenants...")
-    await bot_manager.start_all_tenant_bots()
+    try:
+        await bot_manager.start_all_tenant_bots()
+    except Exception as e:
+        logger.warning(f"Bot startup skipped due to an error: {e}. The app will continue without active bots.")
 
     # Start the automated report scheduler
     try:

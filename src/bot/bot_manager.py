@@ -22,10 +22,17 @@ class BotManager:
 
     async def start_all_tenant_bots(self):
         """Starts a bot runner for every active tenant in the database."""
-        async with async_session() as session:
-            result = await session.execute(select(Tenant).where(Tenant.is_active == True))
-            tenants = result.scalars().all()
-            
+        try:
+            async with async_session() as session:
+                result = await session.execute(select(Tenant).where(Tenant.is_active == True))
+                tenants = result.scalars().all()
+        except Exception as e:
+            logger.warning(
+                f"Could not query tenants table during startup (database may be freshly "
+                f"created or migration pending): {e}. Skipping bot startup."
+            )
+            return
+
         logger.info(f"Found {len(tenants)} active tenants. Starting bots...")
         for tenant in tenants:
             await self.start_tenant_bot(tenant)
